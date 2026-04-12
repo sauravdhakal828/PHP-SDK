@@ -1,0 +1,32 @@
+{
+  "name": "botversion/sdk",
+  "description": "BotVersion SDK — automatically discover and register your API endpoints",
+  "version": "1.0.0",
+  "type": "library",
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "BotVersion",
+      "email": "support@botversion.com"
+    }
+  ],
+  "require": {
+    "php": ">=8.0",
+    "laravel/framework": ">=9.0"
+  },
+  "autoload": {
+    "classmap": [
+      "."
+    ]
+  },
+  "bin": [
+    "bin/botversion-init.php"
+  ],
+  "keywords": [
+    "botversion",
+    "api",
+    "sdk",
+    "laravel"
+  ],
+  "homepage": "https://github.com/botversion/botversion-sdk-php"
+}
