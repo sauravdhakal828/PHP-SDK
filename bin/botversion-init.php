@@ -7,7 +7,7 @@ require_once __DIR__ . '/../cli/Generator.php';
 require_once __DIR__ . '/../cli/Writer.php';
 require_once __DIR__ . '/../cli/Prompts.php';
 
-// ─── COLORS ──────────────────────────────────────────────────────────────────
+// ─── COLORS ───────────────────────────────────────────────────────────────────
 
 function colorize(string $text, string $color): string
 {
@@ -24,11 +24,11 @@ function colorize(string $text, string $color): string
     return ($colors[$color] ?? '') . $text . $colors['reset'];
 }
 
-function cliInfo(string $msg): void  { echo colorize("  ℹ", 'cyan') . "  $msg\n"; }
-function cliSuccess(string $msg): void { echo colorize("  ✔", 'green') . "  $msg\n"; }
-function cliWarn(string $msg): void  { echo colorize("  ⚠", 'yellow') . "  $msg\n"; }
-function cliError(string $msg): void { echo colorize("  ✖", 'red') . "  $msg\n"; }
-function cliStep(string $msg): void  { echo "\n" . colorize("  → $msg", 'bold') . "\n"; }
+function cliInfo(string $msg): void    { echo colorize("  ℹ", 'cyan')   . "  $msg\n"; }
+function cliSuccess(string $msg): void { echo colorize("  ✔", 'green')  . "  $msg\n"; }
+function cliWarn(string $msg): void    { echo colorize("  ⚠", 'yellow') . "  $msg\n"; }
+function cliError(string $msg): void   { echo colorize("  ✖", 'red')    . "  $msg\n"; }
+function cliStep(string $msg): void    { echo "\n" . colorize("  → $msg", 'bold') . "\n"; }
 
 // ─── PARSE ARGS ───────────────────────────────────────────────────────────────
 
@@ -49,6 +49,37 @@ function parseArgs(array $argv): array
     }
 
     return $args;
+}
+
+// ─── FETCH PROJECT INFO ───────────────────────────────────────────────────────
+
+function fetchProjectInfo(string $apiKey): array
+{
+    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://app.botversion.com';
+    $url  = rtrim($base, '/') . '/api/sdk/project-info?workspaceKey=' . urlencode($apiKey);
+
+    $context = stream_context_create([
+        'http' => [
+            'method'        => 'GET',
+            'timeout'       => 10,
+            'ignore_errors' => true,
+        ],
+    ]);
+
+    $response = @file_get_contents($url, false, $context);
+
+    if ($response === false) {
+        throw new RuntimeException("Could not connect to BotVersion platform at: $base");
+    }
+
+    $data = json_decode($response, true);
+
+    if (!$data || isset($data['error'])) {
+        throw new RuntimeException("Invalid API key or project not found.");
+    }
+
+    return $data;
+    // returns ['projectId', 'publicKey', 'apiUrl', 'cdnUrl']
 }
 
 // ─── BANNER ───────────────────────────────────────────────────────────────────
@@ -82,10 +113,21 @@ function main(): void
     $cwd     = $args['cwd'];
     $changes = ['modified' => [], 'created' => [], 'backups' => [], 'manual' => []];
 
+    // ── Fetch project info from platform ──────────────────────────────────────
+    cliStep("Fetching project info from platform...");
+    try {
+        $projectInfo = fetchProjectInfo($args['key']);
+        cliSuccess("Project found — ID: {$projectInfo['projectId']}");
+    } catch (Throwable $e) {
+        cliError("Could not fetch project info: " . $e->getMessage());
+        exit(1);
+    }
+
     // ── Detect environment ────────────────────────────────────────────────────
     cliStep("Scanning your project...");
 
-    $detected = BotVersionDetector::detect($cwd);
+    $detected                = BotVersionDetector::detect($cwd);
+    $detected['projectInfo'] = $projectInfo;
 
     // ── Check already initialized ─────────────────────────────────────────────
     if ($detected['alreadyInitialized'] && !$args['force']) {
@@ -99,10 +141,17 @@ function main(): void
     cliStep("Detecting framework...");
 
     if (!$detected['framework']) {
-        cliError("Could not detect a supported framework.");
+        cliError("Could not detect a supported PHP framework.");
         echo "\n  Supported: Laravel\n";
         echo "  Make sure you have a composer.json and artisan file.\n\n";
         exit(1);
+    }
+
+    // Warn gracefully for detected-but-unsupported frameworks
+    if (in_array($detected['framework'], ['slim', 'symfony'])) {
+        cliWarn("Detected: {$detected['framework']} (not yet supported for auto-setup).");
+        echo "\n  Manual setup instructions: https://docs.botversion.com/{$detected['framework']}\n\n";
+        exit(0);
     }
 
     cliSuccess("Framework: {$detected['framework']}");
@@ -115,6 +164,14 @@ function main(): void
     if (!$auth['name']) {
         cliWarn("No auth library detected automatically.");
         $auth             = BotVersionPrompts::promptAuthLibrary();
+        $detected['auth'] = $auth;
+    } elseif (!$auth['supported']) {
+        // Detected but not yet supported — warn and ask whether to continue
+        cliWarn("Detected: {$auth['name']} (not yet supported for auto-setup).");
+        cliWarn("Will set up without user context — you can add it manually later.");
+        $proceed = BotVersionPrompts::confirm("Continue without auth?", true);
+        if (!$proceed) exit(0);
+        $auth             = ['name' => $auth['name'], 'supported' => false];
         $detected['auth'] = $auth;
     } else {
         cliSuccess("Auth: {$auth['name']}");
@@ -157,17 +214,22 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
 {
     cliStep("Setting up Laravel...");
 
+    $auth = $detected['auth'];
+
     // ── 1. Inject into AppServiceProvider ────────────────────────────────────
     $providerPath = $cwd . '/app/Providers/AppServiceProvider.php';
 
     if (!file_exists($providerPath)) {
         cliWarn("Could not find AppServiceProvider.php automatically.");
-        $manualPath   = BotVersionPrompts::promptFilePath("Enter path to your ServiceProvider (e.g. app/Providers/AppServiceProvider.php): ");
+        $manualPath   = BotVersionPrompts::promptFilePath(
+            "Enter path to your ServiceProvider (e.g. app/Providers/AppServiceProvider.php): "
+        );
         $providerPath = $cwd . '/' . ltrim($manualPath, '/');
     }
 
     if (file_exists($providerPath)) {
-        $initCode = BotVersionGenerator::generateLaravelServiceProviderCode();
+        // Pass $auth so the generated code is auth-aware
+        $initCode = BotVersionGenerator::generateLaravelServiceProviderCode($auth);
         $result   = BotVersionWriter::injectIntoServiceProvider($providerPath, $initCode, $args['force']);
 
         if ($result['success']) {
@@ -183,7 +245,7 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
         }
     } else {
         cliError("ServiceProvider not found: $providerPath");
-        $initCode = BotVersionGenerator::generateLaravelServiceProviderCode();
+        $initCode            = BotVersionGenerator::generateLaravelServiceProviderCode($auth);
         $changes['manual'][] = "Add to your AppServiceProvider::boot():\n\n" . $initCode;
     }
 
@@ -196,14 +258,70 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
         $changes['created'][] = 'routes/api.php';
     }
 
-    $chatRouteCode = BotVersionGenerator::generateLaravelChatRoute();
+    // Pass $auth so the generated route includes the correct middleware
+    $chatRouteCode = BotVersionGenerator::generateLaravelChatRoute($auth);
     $result        = BotVersionWriter::injectChatRoute($apiRoutesPath, $chatRouteCode, $args['force']);
 
     if ($result['success']) {
         cliSuccess("Added BotVersion chat route to routes/api.php");
         $changes['modified'][] = 'routes/api.php';
+        if (!empty($result['backup'])) $changes['backups'][] = $result['backup'];
     } elseif ($result['reason'] === 'already_exists') {
         cliWarn("BotVersion chat route already exists in routes/api.php — skipping.");
+    }
+
+    // ── 3. Inject script tag into frontend file ───────────────────────────────
+    injectFrontendScriptTag($detected, $changes, $cwd, $args['force']);
+}
+
+// ─── INJECT FRONTEND SCRIPT TAG ───────────────────────────────────────────────
+
+function injectFrontendScriptTag(array $detected, array &$changes, string $cwd, bool $force): void
+{
+    $frontendMainFile = $detected['frontendMainFile'] ?? null;
+    $projectInfo      = $detected['projectInfo']      ?? null;
+
+    if (!$projectInfo) {
+        return;
+    }
+
+    $scriptTag = BotVersionGenerator::generateScriptTag($projectInfo);
+
+    if (!$frontendMainFile) {
+        cliWarn("Could not find a frontend HTML or Blade layout file automatically.");
+        echo "\n  Add this script tag manually to your main layout file before </body>:\n\n";
+        echo $scriptTag . "\n\n";
+        $changes['manual'][] = "Add to your main layout file before </body>:\n\n" . $scriptTag;
+        return;
+    }
+
+    // Warn if we only found welcome.blade.php — it only covers one page
+    if (!empty($frontendMainFile['isWelcomeOnly'])) {
+        cliWarn("Only found welcome.blade.php — this only covers one page.");
+        cliWarn("Consider moving the script tag to a shared layout in resources/views/layouts/.");
+    }
+
+    $result  = BotVersionWriter::injectScriptTag(
+        $frontendMainFile['file'],
+        $frontendMainFile['type'],
+        $scriptTag,
+        $force
+    );
+
+    $relPath = ltrim(str_replace($cwd, '', $frontendMainFile['file']), '/');
+
+    if ($result['success']) {
+        cliSuccess("Injected script tag into {$relPath}");
+        $changes['modified'][] = $relPath;
+        if (!empty($result['backup'])) {
+            $changes['backups'][] = $result['backup'];
+        }
+    } elseif ($result['reason'] === 'already_exists') {
+        cliWarn("BotVersion script tag already exists — skipping.");
+    } else {
+        cliWarn("Could not auto-inject script tag. Add this manually to your HTML before </body>:");
+        echo "\n" . $scriptTag . "\n\n";
+        $changes['manual'][] = "Add to your frontend HTML before </body>:\n\n" . $scriptTag;
     }
 }
 

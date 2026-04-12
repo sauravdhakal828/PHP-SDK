@@ -3,15 +3,23 @@
 
 class BotVersionPrompts
 {
+    // ─── STDIN HANDLE (opened once, reused throughout) ────────────────────────
+
+    private static function stdin()
+    {
+        static $handle = null;
+        if ($handle === null) {
+            $handle = fopen('php://stdin', 'r');
+        }
+        return $handle;
+    }
+
     // ─── BASE HELPERS ─────────────────────────────────────────────────────────
 
     public static function ask(string $question): string
     {
         echo $question;
-        $handle = fopen('php://stdin', 'r');
-        $answer = trim(fgets($handle));
-        fclose($handle);
-        return $answer;
+        return trim(fgets(self::stdin()));
     }
 
     public static function askChoice(string $question, array $choices): array
@@ -52,13 +60,37 @@ class BotVersionPrompts
     public static function promptAuthLibrary(): array
     {
         $choices = [
-            ['label' => 'Laravel Sanctum',          'value' => ['name' => 'sanctum',          'supported' => true]],
-            ['label' => 'Laravel Passport',          'value' => ['name' => 'passport',          'supported' => true]],
-            ['label' => 'Tymon JWT Auth',             'value' => ['name' => 'jwt-auth',          'supported' => true]],
-            ['label' => 'Laravel Breeze / Jetstream', 'value' => ['name' => 'laravel-auth',      'supported' => true]],
-            ['label' => 'Spatie Permission',          'value' => ['name' => 'spatie-permission', 'supported' => true]],
-            ['label' => 'Other / Custom',             'value' => ['name' => 'custom',            'supported' => false]],
-            ['label' => 'No auth',                    'value' => ['name' => null,                'supported' => false]],
+            [
+                'label' => 'Laravel Sanctum',
+                'value' => ['name' => 'sanctum',     'supported' => true],
+            ],
+            [
+                'label' => 'Laravel Passport',
+                'value' => ['name' => 'passport',    'supported' => true],
+            ],
+            [
+                'label' => 'Tymon JWT Auth',
+                'value' => ['name' => 'jwt-auth',    'supported' => true],
+            ],
+            [
+                'label' => 'Laravel Breeze / Jetstream',
+                'value' => ['name' => 'laravel-auth', 'supported' => true],
+            ],
+            [
+                // Spatie handles roles/permissions only — not login.
+                // It must be paired with another auth library (e.g. Sanctum).
+                // We still support it for user context (role extraction).
+                'label' => 'Spatie Permission (roles only — pair with Sanctum or Passport)',
+                'value' => ['name' => 'spatie-permission', 'supported' => true],
+            ],
+            [
+                'label' => 'Other / Custom',
+                'value' => ['name' => 'custom', 'supported' => false],
+            ],
+            [
+                'label' => 'No auth',
+                'value' => ['name' => null, 'supported' => false],
+            ],
         ];
 
         $choice = self::askChoice(
