@@ -55,7 +55,7 @@ function parseArgs(array $argv): array
 
 function fetchProjectInfo(string $apiKey): array
 {
-    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://app.botversion.com';
+    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://chatbusiness-two.vercel.app';
     $url  = rtrim($base, '/') . '/api/sdk/project-info?workspaceKey=' . urlencode($apiKey);
 
     $context = stream_context_create([
@@ -106,7 +106,7 @@ function main(): void
     if (!$args['key']) {
         cliError("API key is required.");
         echo "\n  Usage: php vendor/bin/botversion-init --key YOUR_WORKSPACE_KEY\n\n";
-        echo "  Get your key from: https://app.botversion.com/settings\n\n";
+        echo "  Get your key from: https://chatbusiness-two.vercel.app//settings\n\n";
         exit(1);
     }
 
@@ -252,19 +252,24 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
     // ── 2. Create chat route in routes/api.php ────────────────────────────────
     $apiRoutesPath = $cwd . '/routes/api.php';
 
+    $apiRouteIsNew = false;
+
     if (!file_exists($apiRoutesPath)) {
         cliWarn("Could not find routes/api.php — creating it.");
         file_put_contents($apiRoutesPath, "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n");
-        $changes['created'][] = 'routes/api.php';
+        $apiRouteIsNew = true;
     }
 
-    // Pass $auth so the generated route includes the correct middleware
     $chatRouteCode = BotVersionGenerator::generateLaravelChatRoute($auth);
     $result        = BotVersionWriter::injectChatRoute($apiRoutesPath, $chatRouteCode, $args['force']);
 
     if ($result['success']) {
         cliSuccess("Added BotVersion chat route to routes/api.php");
-        $changes['modified'][] = 'routes/api.php';
+        if ($apiRouteIsNew) {
+            $changes['created'][] = 'routes/api.php';
+        } else {
+            $changes['modified'][] = 'routes/api.php';
+        }
         if (!empty($result['backup'])) $changes['backups'][] = $result['backup'];
     } elseif ($result['reason'] === 'already_exists') {
         cliWarn("BotVersion chat route already exists in routes/api.php — skipping.");

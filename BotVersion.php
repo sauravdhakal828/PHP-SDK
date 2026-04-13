@@ -47,7 +47,7 @@ class BotVersion
 
         self::$client = new BotVersionClient([
             'api_key'      => $apiKey,
-            'platform_url' => $options['platform_url'] ?? 'https://app.botversion.com',
+            'platform_url' => $options['platform_url'] ?? 'https://chatbusiness-two.vercel.app',
             'debug'        => $debug,
             'timeout'      => $options['timeout'] ?? 5,
         ]);

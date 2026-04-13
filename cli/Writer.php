@@ -65,7 +65,7 @@ class BotVersionWriter
         // $pos now points to the closing } of boot()
         // Inject our code just before it
         $indented      = self::indentCode($codeToInject, '        ');
-        $injection     = "\n        " . $indented . "\n    ";
+        $injection     = "\n" . $indented . "\n    ";
 
         $newContent = substr($content, 0, $bracePos + 1)
             . $injection

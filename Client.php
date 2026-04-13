@@ -14,7 +14,7 @@ class BotVersionClient
     public function __construct(array $options)
     {
         $this->apiKey      = $options['api_key'];
-        $this->platformUrl = rtrim($options['platform_url'] ?? 'https://app.botversion.com', '/');
+        $this->platformUrl = rtrim($options['platform_url'] ?? 'https://chatbusiness-two.vercel.app', '/');
         $this->debug       = $options['debug'] ?? false;
         $this->timeout     = $options['timeout'] ?? 5;
     }
