@@ -11,8 +11,6 @@ class BotVersionDetector
     ];
 
     // ─── SCAN FOR SEPARATE FRONTEND FOLDER ───────────────────────────────────
-    // Only looks in subdirectories — never returns the root itself,
-    // because Laravel's own package.json would be a false positive.
 
     public static function scanForFrontendFolder(string $cwd): ?array
     {
@@ -29,7 +27,6 @@ class BotVersionDetector
                 $fullPath = $dir . '/' . $entry;
                 if (!is_dir($fullPath)) continue;
 
-                // Check if this subdirectory has a frontend package.json
                 $pkgPath = $fullPath . '/package.json';
                 if (file_exists($pkgPath)) {
                     try {
@@ -42,7 +39,6 @@ class BotVersionDetector
                     }
                 }
 
-                // Recurse deeper
                 $result = $walk($fullPath, $depth + 1);
                 if ($result) return $result;
             }
@@ -50,7 +46,6 @@ class BotVersionDetector
             return null;
         };
 
-        // Start walking from $cwd but never treat $cwd itself as a result
         return $walk($cwd, 0);
     }
 
@@ -105,34 +100,27 @@ class BotVersionDetector
     {
         $framework = self::detectFrontendFramework($pkg);
 
-        // ── Angular ───────────────────────────────────────────────────────────
         if ($framework === 'angular') {
             $candidate = $dir . '/src/index.html';
             if (file_exists($candidate)) return ['file' => $candidate, 'type' => 'html'];
             return null;
         }
 
-        // ── Vite-based ────────────────────────────────────────────────────────
         if (in_array($framework, ['react-vite', 'vue', 'svelte', 'sveltekit', 'solid', 'preact'])) {
             if (file_exists($dir . '/index.html'))        return ['file' => $dir . '/index.html',        'type' => 'html'];
             if (file_exists($dir . '/public/index.html')) return ['file' => $dir . '/public/index.html', 'type' => 'html'];
             return null;
         }
 
-        // ── React CRA ─────────────────────────────────────────────────────────
         if ($framework === 'react-cra') {
             if (file_exists($dir . '/public/index.html')) return ['file' => $dir . '/public/index.html', 'type' => 'html'];
             if (file_exists($dir . '/index.html'))        return ['file' => $dir . '/index.html',        'type' => 'html'];
             return null;
         }
 
-        // ── Unknown — scan common locations ───────────────────────────────────
         $candidates = [
-            'index.html',
-            'public/index.html',
-            'static/index.html',
-            'src/index.html',
-            'www/index.html',
+            'index.html', 'public/index.html',
+            'static/index.html', 'src/index.html', 'www/index.html',
         ];
 
         foreach ($candidates as $candidate) {
@@ -145,7 +133,6 @@ class BotVersionDetector
             }
         }
 
-        // ── Last resort — deep scan ───────────────────────────────────────────
         $found = self::findHtmlFile($dir);
         if ($found) return ['file' => $found, 'type' => 'html'];
 
@@ -153,13 +140,9 @@ class BotVersionDetector
     }
 
     // ─── FIND MAIN BLADE TEMPLATE ─────────────────────────────────────────────
-    // Looks for the main Laravel Blade LAYOUT file — not page views.
-    // The script tag must be in the layout so it appears on every page.
 
     public static function findMainBladeTemplate(string $cwd): ?array
     {
-        // Priority: layout files first (script tag must cover all pages)
-        // welcome.blade.php is last resort — warn the user it only covers one page
         $candidates = [
             'resources/views/layouts/app.blade.php',
             'resources/views/layouts/master.blade.php',
@@ -178,8 +161,6 @@ class BotVersionDetector
             }
         }
 
-        // welcome.blade.php is a single page — only use if nothing else found,
-        // and the caller should warn the user about it.
         $welcome = $cwd . '/resources/views/welcome.blade.php';
         if (file_exists($welcome)) {
             $content = file_get_contents($welcome);
@@ -224,22 +205,198 @@ class BotVersionDetector
         return $walk($dir, 0);
     }
 
+    // ─── SCORE LARAVEL FILE ───────────────────────────────────────────────────────
+
+    public static function scoreLaravelFile(string $content, string $filePath): int
+    {
+        $score    = 0;
+        $filename = basename($filePath);
+
+        // High confidence — registers as service provider
+        if (preg_match('/class\s+\w+\s+extends\s+ServiceProvider/', $content))   $score += 10;
+        // High confidence — boot() method present (entry point for init)
+        if (preg_match('/public\s+function\s+boot\s*\(/', $content))             $score += 10;
+        // High confidence — register() method present
+        if (preg_match('/public\s+function\s+register\s*\(/', $content))         $score += 8;
+        // High confidence — uses Application instance
+        if (preg_match('/\$this->app/', $content))                                $score += 6;
+        // Medium — references other providers
+        if (preg_match('/protected\s+\$providers/', $content))                   $score += 5;
+        // Low — just uses Laravel namespace
+        if (str_contains($content, 'Illuminate\\'))                               $score += 1;
+
+        // Penalties — test files
+        if (preg_match('/(Test|Spec)\.php$/', $filename))                        $score -= 10;
+        // Penalties — migration files
+        if (str_contains($filePath, '/migrations/'))                             $score -= 10;
+        // Penalties — model files (not entry points)
+        if (preg_match('/extends\s+Model/', $content))                           $score -= 8;
+        // Penalties — controller files
+        if (preg_match('/extends\s+Controller/', $content))                      $score -= 8;
+        // Penalties — middleware files
+        if (preg_match('/public\s+function\s+handle\s*\(\s*Request/', $content)) $score -= 6;
+
+        // Filename bonus
+        if ($filename === 'AppServiceProvider.php')                              $score += 5;
+        if (str_ends_with($filename, 'ServiceProvider.php'))                     $score += 3;
+
+        return $score;
+    }
+
+    // ─── PARSE ENTRY FROM CONFIG FILES ───────────────────────────────────────────
+
+    public static function parseEntryFromConfigFiles(string $cwd): ?string
+    {
+        /**
+         * Extracts the likely service provider from Procfile or Dockerfile.
+         * Covers patterns like:
+         *   Procfile:   web: php artisan serve
+         *   Dockerfile: CMD ["php", "artisan", "serve"]
+         *   Dockerfile: ENTRYPOINT ["php", "-S", "0.0.0.0:8000", "-t", "public"]
+         *
+        * For Laravel, if we find artisan being used, we can confidently
+         * return AppServiceProvider as the entry point.
+         */
+
+        $laravelSignals = ['artisan', 'laravel', 'php-fpm'];
+
+        // ── 1. Check Procfile ─────────────────────────────────────────────────────
+        $procfilePath = $cwd . '/Procfile';
+        if (file_exists($procfilePath)) {
+            $lines = explode("\n", file_get_contents($procfilePath));
+            foreach ($lines as $line) {
+                $line = trim($line);
+                if (!$line || str_starts_with($line, '#')) continue;
+
+                foreach ($laravelSignals as $signal) {
+                    if (str_contains($line, $signal)) {
+                        // Confirmed Laravel — return standard provider path
+                        $providerPath = $cwd . '/app/Providers/AppServiceProvider.php';
+                        if (file_exists($providerPath)) return $providerPath;
+                    }
+                }
+            }
+        }
+
+        // ── 2. Check Dockerfile ───────────────────────────────────────────────────
+        $dockerfilePath = $cwd . '/Dockerfile';
+        if (file_exists($dockerfilePath)) {
+            $lines = explode("\n", file_get_contents($dockerfilePath));
+            foreach ($lines as $line) {
+                $line = trim($line);
+                if (!$line || str_starts_with($line, '#')) continue;
+
+                foreach ($laravelSignals as $signal) {
+                    if (str_contains($line, $signal)) {
+                        $providerPath = $cwd . '/app/Providers/AppServiceProvider.php';
+                        if (file_exists($providerPath)) return $providerPath;
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    // ─── DETECT SERVICE PROVIDER ──────────────────────────────────────────────────
+
+    public static function detectServiceProvider(string $cwd): ?string
+    {
+        /**
+         * Finds the best service provider file to inject into.
+         * Uses scoring instead of first-match so it works for:
+         * - Standard AppServiceProvider
+         * - Custom named providers (e.g. BootServiceProvider)
+         * - Providers in non-standard locations
+         */
+        $skipDirs = array_merge(self::$skipDirs, [
+            'tests', 'test', 'migrations', 'database',
+            'storage', 'bootstrap', 'public', 'resources',
+            'lang', 'config', 'routes',
+        ]);
+  
+        $scoredCandidates = [];
+
+        $walk = function (string $directory, int $depth) use (&$walk, &$scoredCandidates, $skipDirs): void {
+            if ($depth > 4) return;
+
+            $entries = @scandir($directory);
+            if (!$entries) return;
+
+            foreach ($entries as $entry) {
+                if ($entry === '.' || $entry === '..') continue;
+                if (in_array($entry, $skipDirs))       continue;
+                if (str_starts_with($entry, '.'))      continue;
+
+                $fullPath = $directory . '/' . $entry;
+
+                if (is_dir($fullPath)) {
+                    $walk($fullPath, $depth + 1);
+                } elseif (str_ends_with($entry, '.php')) {
+                    $content = @file_get_contents($fullPath);
+                    if (!$content) continue;
+
+                    $score = self::scoreLaravelFile($content, $fullPath);
+                    if ($score > 0) {
+                        $scoredCandidates[] = ['score' => $score, 'path' => $fullPath];
+                    }
+                }
+            }
+        };
+
+        $walk($cwd, 0);
+
+        if (empty($scoredCandidates)) {
+            // Nothing found by scoring — try Procfile/Dockerfile
+            return self::parseEntryFromConfigFiles($cwd);
+        }
+
+        // Sort by score descending
+        usort($scoredCandidates, fn($a, $b) => $b['score'] - $a['score']);
+        $best = $scoredCandidates[0];
+
+        // If best score is weak, cross-check with Procfile/Dockerfile
+        if ($best['score'] <= 3) {
+            $configEntry = self::parseEntryFromConfigFiles($cwd);
+            if ($configEntry) return $configEntry;
+        }
+
+        return $best['path'];
+    }
+
     // ─── MAIN DETECT ──────────────────────────────────────────────────────────
 
     public static function detect(string $cwd): array
     {
         $composer  = self::readComposerJson($cwd);
         $framework = self::detectFramework($cwd, $composer);
-        $auth      = self::detectAuth($composer);
 
-        // ── Frontend detection (3-step fallback chain) ────────────────────────
+        // ── If no framework found in root, scan common backend folders ────────
+        $backendRoot = $cwd;
+        if (!$framework) {
+            $backendDirs = ['backend', 'api', 'server', 'services', 'app'];
+            foreach ($backendDirs as $dir) {
+                $candidatePath = $cwd . '/' . $dir;
+                if (!is_dir($candidatePath)) continue;
 
-        $frontendMainFile  = null;
-        $frontendWarnOnly  = false;
+                $candidateComposer  = self::readComposerJson($candidatePath);
+                $candidateFramework = self::detectFramework($candidatePath, $candidateComposer);
 
-        // Step 1: look for a SEPARATE frontend folder with its own package.json
-        // (e.g. a React app living alongside the Laravel backend)
+                if ($candidateFramework) {
+                    $backendRoot = $candidatePath;
+                    $composer    = $candidateComposer;
+                    $framework   = $candidateFramework;
+                    break;
+                }
+            }
+        }
+  
+        $frontendMainFile = null;
+        $frontendWarnOnly = false;
+
+        // Scan for a separate frontend folder (e.g. /frontend, /client)
         $frontendFolder = self::scanForFrontendFolder($cwd);
+
         if ($frontendFolder) {
             $frontendMainFile = self::findMainFrontendFile(
                 $frontendFolder['dir'],
@@ -247,33 +404,30 @@ class BotVersionDetector
             );
         }
 
-        // Step 2: look for a Blade LAYOUT template in resources/views/layouts/
-        // This is the correct target for Laravel — covers all pages via @extends
+        // Fallback — look for a Blade template inside Laravel
         if (!$frontendMainFile) {
-            $bladeResult = self::findMainBladeTemplate($cwd);
+            $bladeResult = self::findMainBladeTemplate($backendRoot);
             if ($bladeResult) {
                 $frontendMainFile = $bladeResult;
-                // Flag if we only found welcome.blade.php — caller should warn
                 if (!empty($bladeResult['isWelcomeOnly'])) {
                     $frontendWarnOnly = true;
                 }
             }
         }
 
-        // Step 3: DO NOT fall back to plain HTML scan for Laravel projects.
-        // public/index.html in Laravel is a Vite stub, not the real frontend.
-        // If we still have nothing, leave it null and let the caller handle it.
-
         return [
-            'cwd'                  => $cwd,
-            'composer'             => $composer,
-            'framework'            => $framework,
-            'auth'                 => $auth,
-            'frontendMainFile'     => $frontendMainFile,
-            'frontendWarnOnly'     => $frontendWarnOnly,
-            'alreadyInitialized'   => self::detectExistingBotVersion($cwd),
+            'cwd'                => $cwd,
+            'backendRoot'        => $backendRoot,
+            'composer'           => $composer,
+            'framework'          => $framework,
+            'frontendMainFile'   => $frontendMainFile,
+            'frontendWarnOnly'   => $frontendWarnOnly,
+            'frontendFolder'     => $frontendFolder,
+            'alreadyInitialized' => self::detectExistingBotVersion($backendRoot),
+            'serviceProvider'    => self::detectServiceProvider($backendRoot),
         ];
     }
+
 
     // ─── COMPOSER.JSON ────────────────────────────────────────────────────────
 
@@ -292,7 +446,6 @@ class BotVersionDetector
 
     public static function detectFramework(string $cwd, ?array $composer): ?string
     {
-        // artisan file is the definitive Laravel indicator
         if (file_exists($cwd . '/artisan')) {
             return 'laravel';
         }
@@ -303,35 +456,12 @@ class BotVersionDetector
                 $composer['require-dev'] ?? []
             );
 
-            if (isset($deps['laravel/framework']))        return 'laravel';
-            if (isset($deps['slim/slim']))                return 'slim';      // unsupported
-            if (isset($deps['symfony/framework-bundle'])) return 'symfony';   // unsupported
+            if (isset($deps['laravel/framework']))         return 'laravel';
+            if (isset($deps['slim/slim']))                 return 'slim';      // unsupported
+            if (isset($deps['symfony/framework-bundle']))  return 'symfony';   // unsupported
         }
 
         return null;
-    }
-
-    // ─── AUTH DETECTION ───────────────────────────────────────────────────────
-
-    public static function detectAuth(?array $composer): array
-    {
-        if (!$composer) return ['name' => null, 'supported' => false];
-
-        $deps = array_merge(
-            $composer['require'] ?? [],
-            $composer['require-dev'] ?? []
-        );
-
-        if (isset($deps['laravel/sanctum']))   return ['name' => 'sanctum',          'supported' => true];
-        if (isset($deps['laravel/passport']))  return ['name' => 'passport',          'supported' => true];
-        if (isset($deps['tymon/jwt-auth']))    return ['name' => 'jwt-auth',          'supported' => true];
-        if (isset($deps['laravel/breeze']) || isset($deps['laravel/jetstream']))
-                                               return ['name' => 'laravel-auth',      'supported' => true];
-        if (isset($deps['laravel/fortify']))   return ['name' => 'fortify',           'supported' => true];
-        if (isset($deps['spatie/laravel-permission']))
-                                               return ['name' => 'spatie-permission', 'supported' => true];
-
-        return ['name' => null, 'supported' => false];
     }
 
     // ─── EXISTING BOTVERSION DETECTION ───────────────────────────────────────

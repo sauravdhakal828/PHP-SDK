@@ -55,21 +55,22 @@ function parseArgs(array $argv): array
 
 function fetchProjectInfo(string $apiKey): array
 {
-    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://chatbusiness-two.vercel.app';
+    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'http://localhost:3000';
     $url  = rtrim($base, '/') . '/api/sdk/project-info?workspaceKey=' . urlencode($apiKey);
 
-    $context = stream_context_create([
-        'http' => [
-            'method'        => 'GET',
-            'timeout'       => 10,
-            'ignore_errors' => true,
-        ],
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_HTTPHEADER     => ['Accept: application/json'],
     ]);
 
-    $response = @file_get_contents($url, false, $context);
+    $response  = curl_exec($ch);
+    $curlError = curl_error($ch);
+    curl_close($ch);
 
     if ($response === false) {
-        throw new RuntimeException("Could not connect to BotVersion platform at: $base");
+        throw new RuntimeException("Could not connect to BotVersion platform at: $base — " . $curlError);
     }
 
     $data = json_decode($response, true);
@@ -79,7 +80,6 @@ function fetchProjectInfo(string $apiKey): array
     }
 
     return $data;
-    // returns ['projectId', 'publicKey', 'apiUrl', 'cdnUrl']
 }
 
 // ─── BANNER ───────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ function main(): void
     if (!$args['key']) {
         cliError("API key is required.");
         echo "\n  Usage: php vendor/bin/botversion-init --key YOUR_WORKSPACE_KEY\n\n";
-        echo "  Get your key from: https://chatbusiness-two.vercel.app//settings\n\n";
+        echo "  Get your key from: https://app.botversion.com/settings\n\n";
         exit(1);
     }
 
@@ -156,34 +156,59 @@ function main(): void
 
     cliSuccess("Framework: {$detected['framework']}");
 
-    // ── Auth detection ────────────────────────────────────────────────────────
-    cliStep("Detecting auth library...");
-
-    $auth = $detected['auth'];
-
-    if (!$auth['name']) {
-        cliWarn("No auth library detected automatically.");
-        $auth             = BotVersionPrompts::promptAuthLibrary();
-        $detected['auth'] = $auth;
-    } elseif (!$auth['supported']) {
-        // Detected but not yet supported — warn and ask whether to continue
-        cliWarn("Detected: {$auth['name']} (not yet supported for auto-setup).");
-        cliWarn("Will set up without user context — you can add it manually later.");
-        $proceed = BotVersionPrompts::confirm("Continue without auth?", true);
-        if (!$proceed) exit(0);
-        $auth             = ['name' => $auth['name'], 'supported' => false];
-        $detected['auth'] = $auth;
-    } else {
-        cliSuccess("Auth: {$auth['name']}");
-    }
-
     // ── Setup Laravel ─────────────────────────────────────────────────────────
     if ($detected['framework'] === 'laravel') {
         setupLaravel($detected, $args, $changes, $cwd);
     }
 
+    // ── Also check for a separate Laravel backend folder ──────────────────────
+    $shouldScanForBackend = (
+        realpath($detected['backendRoot'] ?? $cwd) === realpath($cwd)
+    );
+
+    if ($shouldScanForBackend) {
+        cliStep("Checking for separate PHP backend...");
+        $backendDirs       = ['backend', 'api', 'server', 'services'];
+        $phpBackendFound   = false;
+
+        foreach ($backendDirs as $dir) {
+            $backendPath = $cwd . '/' . $dir;
+            if (!is_dir($backendPath)) continue;
+
+            if (realpath($backendPath) === realpath($detected['backendRoot'] ?? $cwd)) continue;
+
+            $backendComposer  = BotVersionDetector::readComposerJson($backendPath);
+            $backendFramework = BotVersionDetector::detectFramework($backendPath, $backendComposer);
+
+            if (!$backendFramework) continue;
+
+            if (in_array($backendFramework, ['slim', 'symfony'])) {
+                cliWarn("Found {$backendFramework} in \"{$dir}/\" — not yet supported.");
+                continue;
+            }
+
+            $phpBackendFound     = true;
+            $backendDetected     = BotVersionDetector::detect($backendPath);
+            $backendDetected['projectInfo'] = $projectInfo;
+
+            cliWarn("Found PHP backend ({$backendFramework}) in \"{$dir}/\" folder.");
+
+            if ($backendFramework === 'laravel') {
+                setupLaravel($backendDetected, $args, $changes, $cwd);
+            }
+
+            break;
+        }
+
+        if (!$phpBackendFound) {
+            cliInfo("No separate PHP backend found — skipping.");
+        }
+    } else {
+        cliInfo("Backend already detected — skipping separate backend scan.");
+    }
+
     // ── Write API key to .env ─────────────────────────────────────────────────
-    $envPath    = $cwd . '/.env';
+    $envPath    = ($detected['backendRoot'] ?? $cwd) . '/.env';
     $envContent = file_exists($envPath) ? file_get_contents($envPath) : '';
     $envLine    = 'BOTVERSION_API_KEY=' . $args['key'];
 
@@ -214,13 +239,14 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
 {
     cliStep("Setting up Laravel...");
 
-    $auth = $detected['auth'];
-
     // ── 1. Inject into AppServiceProvider ────────────────────────────────────
-    $providerPath = $cwd . '/app/Providers/AppServiceProvider.php';
+    $backendRoot  = $detected['backendRoot'] ?? $cwd;
+    // Use scoring-based detection first, fall back to standard path
+    $providerPath = $detected['serviceProvider']
+        ?? ($backendRoot . '/app/Providers/AppServiceProvider.php');
 
     if (!file_exists($providerPath)) {
-        cliWarn("Could not find AppServiceProvider.php automatically.");
+        cliWarn("Could not find a ServiceProvider automatically.");
         $manualPath   = BotVersionPrompts::promptFilePath(
             "Enter path to your ServiceProvider (e.g. app/Providers/AppServiceProvider.php): "
         );
@@ -228,8 +254,7 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
     }
 
     if (file_exists($providerPath)) {
-        // Pass $auth so the generated code is auth-aware
-        $initCode = BotVersionGenerator::generateLaravelServiceProviderCode($auth);
+        $initCode = BotVersionGenerator::generateLaravelServiceProviderCode();
         $result   = BotVersionWriter::injectIntoServiceProvider($providerPath, $initCode, $args['force']);
 
         if ($result['success']) {
@@ -238,6 +263,34 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
             if (!empty($result['backup'])) $changes['backups'][] = $result['backup'];
         } elseif ($result['reason'] === 'already_exists') {
             cliWarn("BotVersion already found in ServiceProvider — skipping.");
+        } elseif ($result['reason'] === 'boot_not_found') {
+            $response = BotVersionPrompts::promptMissingBootMethod($providerPath);
+
+            if ($response['action'] === 'append') {
+                $appendResult = file_put_contents(
+                    $providerPath,
+                    file_get_contents($providerPath) . "\n\n" . $initCode . "\n"
+                );
+                if ($appendResult !== false) {
+                    cliSuccess("Appended BotVersion::init() to " . basename($providerPath));
+                    $changes['modified'][] = 'app/Providers/AppServiceProvider.php';
+                }
+            } elseif ($response['action'] === 'manual_path') {
+                $altPath = $cwd . '/' . ltrim($response['filePath'], '/');
+                if (file_exists($altPath)) {
+                    $altResult = BotVersionWriter::injectIntoServiceProvider($altPath, $initCode, $args['force']);
+                    if ($altResult['success']) {
+                        cliSuccess("Injected into " . $response['filePath']);
+                        $changes['modified'][] = $response['filePath'];
+                    }
+                } else {
+                    cliError("File not found: {$altPath}");
+                    $changes['manual'][] = "Add to your service provider boot() method:\n\n" . $initCode;
+                }
+            } else {
+                $changes['manual'][] = "Add to AppServiceProvider::boot():\n\n" . $initCode;
+                cliWarn("Skipped — see manual steps below.");
+            }
         } else {
             cliWarn("Could not auto-inject. Add this manually to your AppServiceProvider::boot():");
             echo "\n" . $initCode . "\n";
@@ -245,37 +298,11 @@ function setupLaravel(array $detected, array $args, array &$changes, string $cwd
         }
     } else {
         cliError("ServiceProvider not found: $providerPath");
-        $initCode            = BotVersionGenerator::generateLaravelServiceProviderCode($auth);
+        $initCode            = BotVersionGenerator::generateLaravelServiceProviderCode();
         $changes['manual'][] = "Add to your AppServiceProvider::boot():\n\n" . $initCode;
     }
 
-    // ── 2. Create chat route in routes/api.php ────────────────────────────────
-    $apiRoutesPath = $cwd . '/routes/api.php';
-
-    $apiRouteIsNew = false;
-
-    if (!file_exists($apiRoutesPath)) {
-        cliWarn("Could not find routes/api.php — creating it.");
-        file_put_contents($apiRoutesPath, "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n");
-        $apiRouteIsNew = true;
-    }
-
-    $chatRouteCode = BotVersionGenerator::generateLaravelChatRoute($auth);
-    $result        = BotVersionWriter::injectChatRoute($apiRoutesPath, $chatRouteCode, $args['force']);
-
-    if ($result['success']) {
-        cliSuccess("Added BotVersion chat route to routes/api.php");
-        if ($apiRouteIsNew) {
-            $changes['created'][] = 'routes/api.php';
-        } else {
-            $changes['modified'][] = 'routes/api.php';
-        }
-        if (!empty($result['backup'])) $changes['backups'][] = $result['backup'];
-    } elseif ($result['reason'] === 'already_exists') {
-        cliWarn("BotVersion chat route already exists in routes/api.php — skipping.");
-    }
-
-    // ── 3. Inject script tag into frontend file ───────────────────────────────
+    // ── 2. Inject script tag into frontend file ───────────────────────────────
     injectFrontendScriptTag($detected, $changes, $cwd, $args['force']);
 }
 
@@ -306,7 +333,7 @@ function injectFrontendScriptTag(array $detected, array &$changes, string $cwd, 
         cliWarn("Consider moving the script tag to a shared layout in resources/views/layouts/.");
     }
 
-    $result  = BotVersionWriter::injectScriptTag(
+    $result = BotVersionWriter::injectScriptTag(
         $frontendMainFile['file'],
         $frontendMainFile['type'],
         $scriptTag,

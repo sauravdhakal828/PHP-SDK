@@ -20,6 +20,10 @@ class BotVersionInterceptor
     {
         $this->client  = $client;
         $this->options = $options;
+
+        $client->setExecutor(function (string $method, string $path, $body, string $cookies, array $headers, string $baseUrl) {
+            return $this->makeInternalRequest($method, $path, $body, $cookies, $headers, $baseUrl);
+        });
     }
 
     // ── Laravel middleware handle method ─────────────────────────────────────
@@ -34,12 +38,10 @@ class BotVersionInterceptor
 
             if (!$apiPrefix || str_starts_with($path, $apiPrefix)) {
                 $normalizedPath = $this->normalizePath($path);
-                $bodyStructure = $method !== 'GET'
+                $bodyStructure  = $method !== 'GET'
                     ? $this->buildBodyStructure($request->except(['_token', '_method']))
                     : null;
 
-                // Deduplicate by method:path:sorted-body-fields (same as JS)
-                // so new body fields on existing endpoints get re-reported
                 $bodyKey = $method . ':' . $normalizedPath . ':'
                     . implode(',', array_keys($bodyStructure ?? []));
 
@@ -78,27 +80,17 @@ class BotVersionInterceptor
                 continue;
             }
 
-            // UUID
             if (preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $segment)) {
                 $normalized[] = ':id';
-            }
-            // Numeric
-            elseif (preg_match('/^\d+$/', $segment)) {
+            } elseif (preg_match('/^\d+$/', $segment)) {
                 $normalized[] = ':id';
-            }
-            // cuid pattern (c + 20+ alphanumeric chars)
-            elseif (preg_match('/^c[a-z0-9]{20,}$/i', $segment)) {
+            } elseif (preg_match('/^c[a-z0-9]{20,}$/i', $segment)) {
                 $normalized[] = ':id';
-            }
-            // MongoDB ObjectId
-            elseif (preg_match('/^[0-9a-f]{24}$/i', $segment)) {
+            } elseif (preg_match('/^[0-9a-f]{24}$/i', $segment)) {
                 $normalized[] = ':id';
-            }
-            // Long alphanumeric (likely an ID)
-            elseif (strlen($segment) >= 16 && preg_match('/[a-zA-Z]/', $segment) && preg_match('/[0-9]/', $segment)) {
+            } elseif (strlen($segment) >= 16 && preg_match('/[a-zA-Z]/', $segment) && preg_match('/[0-9]/', $segment)) {
                 $normalized[] = ':id';
-            }
-            else {
+            } else {
                 $normalized[] = $segment;
             }
         }
@@ -110,8 +102,11 @@ class BotVersionInterceptor
     {
         if (empty($body)) return null;
 
-        $sensitiveKeys = ['password', 'token', 'secret', 'apikey', 'api_key', 'creditcard', 'credit_card', 'ssn', 'cvv', 'pin'];
-        $structure     = [];
+        $sensitiveKeys = [
+            'password', 'token', 'secret', 'apikey', 'api_key',
+            'creditcard', 'credit_card', 'ssn', 'cvv', 'pin',
+        ];
+        $structure = [];
 
         foreach ($body as $key => $val) {
             $isSensitive = false;
@@ -140,9 +135,6 @@ class BotVersionInterceptor
         return $structure;
     }
 
-    /**
-     * Convert flat body structure map to JSON Schema format (same as JS interceptor)
-     */
     private function toJsonSchema(?array $bodyStructure): ?array
     {
         if (empty($bodyStructure)) return null;
@@ -160,24 +152,87 @@ class BotVersionInterceptor
         ];
     }
 
+    // ── Report endpoint asynchronously ───────────────────────────────────────
+    // Uses cURL with a very short timeout so it never blocks the user response
+
     private function reportAsync(string $method, string $path, ?array $jsonSchema): void
-{
-    $client = $this->client;
-    $debug = $this->options['debug'] ?? false;
-    
-    register_shutdown_function(function () use ($client, $method, $path, $jsonSchema, $debug) {
-        try {
-            $client->updateEndpoint([
-                'method'      => $method,
-                'path'        => $path,
-                'requestBody' => $jsonSchema,
-                'detectedBy'  => 'runtime',
-            ]);
-        } catch (\Exception $e) {
-            if ($debug) {
-                error_log("[BotVersion SDK] ⚠ Failed to report endpoint: " . $e->getMessage());
-            }
+    {
+        $payload = json_encode([
+            'workspaceKey' => $this->client->getApiKey(),
+            'method'       => $method,
+            'path'         => $path,
+            'requestBody'  => $jsonSchema,
+            'detectedBy'   => 'runtime',
+        ]);
+
+        $url = $this->client->getPlatformUrl() . '/api/sdk/update-endpoint';
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $payload,
+            CURLOPT_TIMEOUT_MS     => 500,
+            CURLOPT_HTTPHEADER     => [
+                'Content-Type: application/json',
+            ],
+        ]);
+        curl_exec($ch);
+        curl_close($ch);
+    }
+
+    private function makeInternalRequest(string $method, string $path, $body, string $cookies, array $headers, string $baseUrl): array
+    {
+        $url = rtrim($baseUrl, '/') . $path;
+        $bodyJson = $body ? json_encode($body) : null;
+
+        $curlHeaders = ['Content-Type: application/json'];
+
+        if ($cookies) {
+            $curlHeaders[] = 'Cookie: ' . $cookies;
         }
-    });
-}
+
+        $auth = $headers['authorization'] ?? $headers['Authorization'] ?? null;
+        if ($auth) {
+            $curlHeaders[] = 'Authorization: ' . $auth;
+        }
+
+        $csrf = $headers['x-csrftoken'] ?? $headers['X-CSRFToken'] ?? $headers['x-xsrf-token'] ?? $headers['X-XSRF-TOKEN'] ?? null;
+        if ($csrf) {
+            $curlHeaders[] = 'X-CSRFToken: ' . $csrf;
+        }
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CUSTOMREQUEST  => strtoupper($method),
+            CURLOPT_HTTPHEADER     => $curlHeaders,
+            CURLOPT_TIMEOUT        => 30,
+            CURLOPT_FOLLOWLOCATION => true,
+        ]);
+
+        if ($bodyJson && strtoupper($method) !== 'GET') {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $bodyJson);
+        }
+
+        $response   = curl_exec($ch);
+        $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error      = curl_error($ch);
+        curl_close($ch);
+
+        if ($response === false) {
+            return ['status' => 500, 'ok' => false, 'data' => ['error' => $error]];
+        }
+
+        $data = json_decode($response, true);
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            $data = ['raw' => $response];
+        }
+
+        return [
+            'status' => $statusCode,
+            'ok'     => $statusCode >= 200 && $statusCode < 300,
+            'data'   => $data,
+        ];
+    }
 }

@@ -39,11 +39,11 @@ class BotVersionWriter
         }
 
         // Count braces to find the correct closing brace of boot()
-        $depth        = 1;
-        $pos          = $bracePos + 1;
-        $length       = strlen($content);
-        $inString     = false;
-        $stringChar   = '';
+        $depth      = 1;
+        $pos        = $bracePos + 1;
+        $length     = strlen($content);
+        $inString   = false;
+        $stringChar = '';
 
         while ($pos < $length && $depth > 0) {
             $char = $content[$pos];
@@ -64,8 +64,8 @@ class BotVersionWriter
 
         // $pos now points to the closing } of boot()
         // Inject our code just before it
-        $indented      = self::indentCode($codeToInject, '        ');
-        $injection     = "\n" . $indented . "\n    ";
+        $indented  = self::indentCode($codeToInject, '        ');
+        $injection = "\n" . $indented . "\n    ";
 
         $newContent = substr($content, 0, $bracePos + 1)
             . $injection
@@ -78,35 +78,14 @@ class BotVersionWriter
     }
 
     // ─── FIND boot() METHOD START POSITION ───────────────────────────────────
-    // Returns the position of "public function boot" in the file content,
-    // or -1 if not found.
 
     private static function findBootMethodStart(string $content): int
     {
-        // Match both: public function boot(): void and public function boot()
         $pattern = '/public\s+function\s+boot\s*\(\s*\)/';
         if (preg_match($pattern, $content, $matches, PREG_OFFSET_CAPTURE)) {
             return $matches[0][1];
         }
         return -1;
-    }
-
-    // ─── INJECT CHAT ROUTE INTO routes/api.php ───────────────────────────────
-
-    public static function injectChatRoute(string $filePath, string $codeToInject, bool $force = false): array
-    {
-        $content = file_get_contents($filePath);
-
-        // Idempotency check — never inject twice, even with --force
-        if (str_contains($content, 'botversion/chat') || str_contains($content, 'BotVersion::chat')) {
-            return ['success' => false, 'reason' => 'already_exists'];
-        }
-
-        // Backup before writing
-        $backup     = self::backupFile($filePath);
-        $newContent = rtrim($content) . "\n" . $codeToInject . "\n";
-        file_put_contents($filePath, $newContent);
-        return ['success' => true, 'backup' => $backup];
     }
 
     // ─── INJECT SCRIPT TAG INTO FRONTEND FILE ────────────────────────────────
@@ -129,8 +108,6 @@ class BotVersionWriter
         $backup = self::backupFile($filePath);
 
         // ── HTML or Blade file — inject before the LAST </body> ──────────────
-        // Using strrpos (last occurrence) to avoid injecting into
-        // comments or strings that contain </body>
         if ($fileType === 'html' || $fileType === 'blade') {
             $pos = strrpos($content, '</body>');
 
