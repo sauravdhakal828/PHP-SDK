@@ -20,10 +20,6 @@ class BotVersionInterceptor
     {
         $this->client  = $client;
         $this->options = $options;
-
-        $client->setExecutor(function (string $method, string $path, $body, string $cookies, array $headers, string $baseUrl) {
-            return $this->makeInternalRequest($method, $path, $body, $cookies, $headers, $baseUrl);
-        });
     }
 
     // ── Laravel middleware handle method ─────────────────────────────────────
@@ -32,6 +28,8 @@ class BotVersionInterceptor
     {
         $path   = '/' . ltrim($request->path(), '/');
         $method = strtoupper($request->method());
+
+        $response = $next($request);
 
         if (!$this->shouldIgnore($path)) {
             $apiPrefix = $this->options['api_prefix'] ?? null;
@@ -48,14 +46,15 @@ class BotVersionInterceptor
                 if (!isset(self::$reported[$bodyKey])) {
                     self::$reported[$bodyKey] = true;
 
-                    $jsonSchema = $this->toJsonSchema($bodyStructure);
-
-                    $this->reportAsync($method, $normalizedPath, $jsonSchema);
+                    if ($response->getStatusCode() < 500) {
+                        $jsonSchema = $this->toJsonSchema($bodyStructure);
+                        $this->reportAsync($method, $normalizedPath, $jsonSchema);
+                    }
                 }
             }
         }
 
-        return $next($request);
+        return $response;
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -179,60 +178,5 @@ class BotVersionInterceptor
         ]);
         curl_exec($ch);
         curl_close($ch);
-    }
-
-    private function makeInternalRequest(string $method, string $path, $body, string $cookies, array $headers, string $baseUrl): array
-    {
-        $url = rtrim($baseUrl, '/') . $path;
-        $bodyJson = $body ? json_encode($body) : null;
-
-        $curlHeaders = ['Content-Type: application/json'];
-
-        if ($cookies) {
-            $curlHeaders[] = 'Cookie: ' . $cookies;
-        }
-
-        $auth = $headers['authorization'] ?? $headers['Authorization'] ?? null;
-        if ($auth) {
-            $curlHeaders[] = 'Authorization: ' . $auth;
-        }
-
-        $csrf = $headers['x-csrftoken'] ?? $headers['X-CSRFToken'] ?? $headers['x-xsrf-token'] ?? $headers['X-XSRF-TOKEN'] ?? null;
-        if ($csrf) {
-            $curlHeaders[] = 'X-CSRFToken: ' . $csrf;
-        }
-
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CUSTOMREQUEST  => strtoupper($method),
-            CURLOPT_HTTPHEADER     => $curlHeaders,
-            CURLOPT_TIMEOUT        => 30,
-            CURLOPT_FOLLOWLOCATION => true,
-        ]);
-
-        if ($bodyJson && strtoupper($method) !== 'GET') {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, $bodyJson);
-        }
-
-        $response   = curl_exec($ch);
-        $statusCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        $error      = curl_error($ch);
-        curl_close($ch);
-
-        if ($response === false) {
-            return ['status' => 500, 'ok' => false, 'data' => ['error' => $error]];
-        }
-
-        $data = json_decode($response, true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            $data = ['raw' => $response];
-        }
-
-        return [
-            'status' => $statusCode,
-            'ok'     => $statusCode >= 200 && $statusCode < 300,
-            'data'   => $data,
-        ];
     }
 }

@@ -11,7 +11,6 @@ class BotVersionGenerator
 // BotVersion AI Agent — auto-added by botversion-sdk init
 \\BotVersion::init(env('BOTVERSION_API_KEY'), [
     'routes_dir' => base_path(),
-    // 'debug' => true,
 ]);
 PHP;
     }

@@ -57,7 +57,6 @@ class BotVersionScanner
                 }
             }
         } catch (\Exception $e) {
-            error_log("[BotVersion SDK] ⚠ Laravel scan error: " . $e->getMessage());
         }
 
         return $endpoints;
@@ -195,7 +194,7 @@ class BotVersionScanner
                 if (preg_match($pattern, $src, $match)) {
                     $fields = self::parseValidationArrayString($match[1]);
                     if (!empty($fields)) {
-                        return self::fieldsToSchema($fields);
+                        return self::fieldsToSchema($fields, $src);
                     }
                 }
             }
@@ -274,7 +273,7 @@ class BotVersionScanner
 
             if (empty($fields)) return null;
 
-            return self::fieldsToSchema(array_keys($fields));
+            return self::fieldsToSchema(array_keys($fields), $src);
 
         } catch (\Exception $e) {
             // Silent fail
@@ -382,16 +381,59 @@ class BotVersionScanner
     /**
      * Convert a simple list of field names to a JSON schema.
      */
-    private static function fieldsToSchema(array $fields): array
+    private static function fieldsToSchema(array $fields, string $sourceCode = ''): array
     {
         $properties = [];
         foreach ($fields as $field) {
+            $type = $sourceCode ? self::inferFieldType($field, $sourceCode) : 'string';
             $properties[$field] = [
-                'type'        => 'string',
+                'type'        => $type,
                 'description' => ucwords(str_replace('_', ' ', $field)),
             ];
         }
         return ['type' => 'object', 'properties' => $properties];
+    }
+
+
+    private static function inferFieldType(string $fieldName, string $sourceCode): string
+    {
+        // Check for array usage
+        $arrayPatterns = [
+            '/\$' . $fieldName . '\s*\[\s*\d+\s*\]/',
+            '/foreach\s*\(\s*\$' . $fieldName . '\s+as\s*/',
+            '/count\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/is_array\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/array_map\s*\([^,]+,\s*\$' . $fieldName . '\s*\)/',
+        ];
+        foreach ($arrayPatterns as $pattern) {
+            if (preg_match($pattern, $sourceCode)) return 'array';
+        }
+
+        // Check for number usage
+        $numberPatterns = [
+            '/\$' . $fieldName . '\s*[+\-*\/%]\s*\d/',
+            '/intval\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/floatval\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/is_int\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/is_float\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/is_numeric\s*\(\s*\$' . $fieldName . '\s*\)/',
+        ];
+        foreach ($numberPatterns as $pattern) {
+            if (preg_match($pattern, $sourceCode)) return 'number';
+        }
+
+        // Check for boolean usage
+        $boolPatterns = [
+            '/\$' . $fieldName . '\s*===?\s*(true|false)/',
+            '/(true|false)\s*===?\s*\$' . $fieldName . '/',
+            '/is_bool\s*\(\s*\$' . $fieldName . '\s*\)/',
+            '/filter_var\s*\(\s*\$' . $fieldName . '\s*,\s*FILTER_VALIDATE_BOOLEAN\s*\)/',
+        ];
+        foreach ($boolPatterns as $pattern) {
+            if (preg_match($pattern, $sourceCode)) return 'boolean';
+        }
+
+        return 'string';
     }
 
     /**
@@ -652,7 +694,6 @@ class BotVersionScanner
             if (empty($paramMap)) continue; // skip static routes with no dynamic params
 
             $patterns[] = ['pattern' => $pattern, 'params' => $paramMap];
-            error_log("[BotVersion SDK] Found frontend route: {$pattern} → " . json_encode($paramMap));
         }
     }
 
@@ -712,8 +753,6 @@ class BotVersionScanner
             $content = file_get_contents($filePath);
             if (!$content) continue;
 
-            error_log("[BotVersion SDK] Scanning config-based routes in: {$filePath}");
-
             // React Router JSX: <Route path="/:projectId/dashboard" />
             preg_match_all('/<Route[^>]+path=["\']([^"\']+)["\']/', $content, $matches);
             foreach ($matches[1] as $path) {
@@ -750,6 +789,5 @@ class BotVersionScanner
         if (empty($paramMap)) return;
 
         $patterns[] = ['pattern' => $normalized, 'params' => $paramMap];
-        error_log("[BotVersion SDK] Found config-based route: {$normalized} → " . json_encode($paramMap));
     }
 }

@@ -44,10 +44,6 @@ class ComposerStaticInit530ff9c5dcbae9b71414ef39d19433ed
         array (
             'voku\\' => 5,
         ),
-        'W' =>
-        array (
-            'WebSocket\\' => 10,
-        ),
         'T' =>
         array (
             'TijsVerkoyen\\CssToInlineStyles\\' => 31,
@@ -165,10 +161,6 @@ class ComposerStaticInit530ff9c5dcbae9b71414ef39d19433ed
         'voku\\' =>
         array (
             0 => __DIR__ . '/..' . '/voku/portable-ascii/src/voku',
-        ),
-        'WebSocket\\' =>
-        array (
-            0 => __DIR__ . '/..' . '/textalk/websocket/lib',
         ),
         'TijsVerkoyen\\CssToInlineStyles\\' =>
         array (

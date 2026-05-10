@@ -11,8 +11,7 @@
   ],
   "require": {
     "php": ">=8.0",
-    "laravel/framework": ">=9.0",
-    "textalk/websocket": "^1.5"
+    "laravel/framework": ">=9.0"
   },
   "autoload": {
     "classmap": [

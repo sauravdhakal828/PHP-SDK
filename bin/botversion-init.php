@@ -55,7 +55,7 @@ function parseArgs(array $argv): array
 
 function fetchProjectInfo(string $apiKey): array
 {
-    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'http://localhost:3000';
+    $base = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://botversion.com';
     $url  = rtrim($base, '/') . '/api/sdk/project-info?workspaceKey=' . urlencode($apiKey);
 
     $ch = curl_init($url);

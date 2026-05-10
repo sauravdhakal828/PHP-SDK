@@ -27,12 +27,20 @@ class BotVersion
     public static function init(string $apiKey, array $options = []): void
     {
         if (self::$initialized) {
-            error_log("[BotVersion SDK] ⚠ Already initialized — skipping");
+            if (!self::$client) return;
+            // Re-attach middleware in case of framework reload
+            $framework = self::detectFramework();
+            if ($framework === 'laravel') {
+                self::attachLaravelMiddleware([
+                    'exclude'    => self::$options['exclude'] ?? [],
+                    'api_prefix' => self::$options['api_prefix'] ?? null,
+                    'debug'      => self::$options['debug'] ?? false,
+                ]);
+            }
             return;
-        }
+        } 
 
         if (empty($apiKey)) {
-            error_log("[BotVersion SDK] ❌ api_key is required.");
             return;
         }
 
@@ -40,33 +48,15 @@ class BotVersion
         self::$options     = $options;
         $debug             = $options['debug'] ?? false;
 
-        if ($debug) {
-            error_log("[BotVersion SDK] Initializing...");
-        }
-
         self::$client = new BotVersionClient([
             'api_key'      => $apiKey,
-            'platform_url' => $options['platform_url'] ?? 'http://localhost:3000',
+            'platform_url' => $options['platform_url'] ?? 'https://botversion.com',
             'debug'        => $debug,
             'timeout'      => $options['timeout'] ?? 5,
         ]);
 
         // ── Detect framework ─────────────────────────────────────────────────
         $framework = self::detectFramework();
-
-        if (!$framework) {
-            error_log("[BotVersion SDK] ❌ Could not detect framework. Only Laravel is currently supported.");
-            return;
-        }
-
-        if ($debug) {
-            error_log("[BotVersion SDK] ✅ Framework detected: {$framework}");
-        }
-
-        if ($framework === 'symfony') {
-            error_log("[BotVersion SDK] Symfony support coming soon.");
-            return;
-        }
 
         $interceptorOptions = [
             'exclude'    => $options['exclude'] ?? [],
@@ -83,19 +73,10 @@ class BotVersion
         if (function_exists('app') && method_exists(app(), 'booted')) {
             app()->booted(function () use ($debug) {
                 try {
-                    if ($debug) {
-                        error_log("[BotVersion SDK] Scanning Laravel routes...");
-                    }
 
                     $endpoints = BotVersionScanner::scanLaravelRoutes();
 
-                    if ($debug) {
-                        error_log("[BotVersion SDK] Found " . count($endpoints) . " routes");
-                    }
-
                     if (empty($endpoints)) {
-                        error_log("[BotVersion SDK] ⚠ No endpoints found.");
-                        error_log("[BotVersion SDK] ⚠ Make sure BotVersion::init() is called in a ServiceProvider.");
                         return;
                     }
 
@@ -104,15 +85,9 @@ class BotVersion
                     if (!empty($patterns)) {
                         self::$client->registerRoutePatterns($patterns);
                     }
-                    
-                    self::$client->connect();
-
-                    if ($debug) {
-                        error_log("[BotVersion SDK] ✅ Initialization complete — " . count($endpoints) . " endpoints registered");
-                    }
                 } catch (\Exception $e) {
                     if ($debug) {
-                        error_log("[BotVersion SDK] ⚠ Scan error: " . $e->getMessage());
+                        error_log('[botversion] Static scan failed: ' . $e->getMessage());
                     }
                 }
             });
@@ -161,12 +136,7 @@ class BotVersion
 
             app(\Illuminate\Contracts\Http\Kernel::class)->appendMiddlewareToGroup('web', BotVersionInterceptor::class);
             app(\Illuminate\Contracts\Http\Kernel::class)->appendMiddlewareToGroup('api', BotVersionInterceptor::class);
-
-            if ($options['debug'] ?? false) {
-                error_log("[BotVersion SDK] ✅ Laravel middleware attached");
-            }
         } catch (\Exception $e) {
-            error_log("[BotVersion SDK] ⚠ Failed to attach middleware: " . $e->getMessage());
         }
     }
 }
