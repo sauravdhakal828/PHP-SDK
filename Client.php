@@ -124,9 +124,20 @@ class BotVersionClient
             throw new \RuntimeException("Request failed: " . $curlError);
         }
 
+        // Handle empty responses gracefully
+        if (empty(trim($response))) {
+            if ($statusCode >= 200 && $statusCode < 300) {
+                return [];
+            }
+            throw new \RuntimeException("Platform returned {$statusCode}: empty response");
+        }
+
         $parsed = json_decode($response, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
+            if ($statusCode >= 200 && $statusCode < 300) {
+                return [];
+            }
             throw new \RuntimeException("Invalid JSON response from platform");
         }
 
@@ -160,9 +171,20 @@ class BotVersionClient
             throw new \RuntimeException("Request failed: " . $curlError);
         }
 
+        // Handle empty responses gracefully
+        if (empty(trim($response))) {
+            if ($statusCode >= 200 && $statusCode < 300) {
+                return [];
+            }
+            throw new \RuntimeException("Platform returned {$statusCode}: empty response");
+        }
+
         $parsed = json_decode($response, true);
 
         if (json_last_error() !== JSON_ERROR_NONE) {
+            if ($statusCode >= 200 && $statusCode < 300) {
+                return [];
+            }
             throw new \RuntimeException("Invalid JSON response from platform");
         }
 

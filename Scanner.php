@@ -62,6 +62,198 @@ class BotVersionScanner
         return $endpoints;
     }
 
+
+    public static function scanLumenRoutes(): array
+    {
+        $endpoints = [];
+        $seen      = [];
+
+        try {
+            $app    = app();
+            $router = $app->router;
+
+            foreach ($router->getRoutes() as $route) {
+                $method = strtoupper($route['method']);
+                $path   = '/' . ltrim($route['uri'], '/');
+
+                if (in_array($method, ['HEAD', 'OPTIONS'])) continue;
+
+                $normalizedPath = preg_replace('/\{([^}?]+)\??}/', ':$1', $path);
+                $key            = $method . ':' . $normalizedPath;
+
+                if (isset($seen[$key])) continue;
+                $seen[$key] = true;
+
+                $endpoints[] = [
+                    'method'      => $method,
+                    'path'        => $normalizedPath,
+                    'description' => self::generateDescription($method, $normalizedPath, null),
+                    'requestBody' => null,
+                    'detectedBy'  => 'static-scan',
+                ];
+            }
+        } catch (\Exception $e) {
+            // Silent
+        }
+
+        return $endpoints;
+    }
+
+    public static function scanSymfonyRoutes($kernel = null): array
+    {
+        $endpoints = [];
+        $seen      = [];
+
+        try {
+            $router = null;
+
+            // Try to get router from the kernel container
+            if ($kernel && method_exists($kernel, 'getContainer')) {
+                $container = $kernel->getContainer();
+                if ($container->has('router')) {
+                    $router = $container->get('router');
+                }
+            }
+
+            // Fallback — try global container if available
+            if (!$router && class_exists('\Symfony\Component\DependencyInjection\ContainerInterface')) {
+                return $endpoints; // Can't scan without a router reference
+            }
+
+            if (!$router) return $endpoints;
+
+            $routeCollection = $router->getRouteCollection();
+
+            foreach ($routeCollection->all() as $name => $route) {
+                // Skip internal Symfony routes
+                if (str_starts_with($name, '_')) continue;
+
+                $path    = $route->getPath();
+                $methods = $route->getMethods();
+
+                // If no methods defined, Symfony accepts all — default to GET
+                if (empty($methods)) $methods = ['GET'];
+
+                // Normalize Symfony path format {id} → :id
+                $normalizedPath = preg_replace('/\{([^}]+)}/', ':$1', $path);
+
+                foreach ($methods as $method) {
+                    $method = strtoupper($method);
+                    if (in_array($method, ['HEAD', 'OPTIONS'])) continue;
+
+                    $key = $method . ':' . $normalizedPath;
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $endpoints[] = [
+                        'method'      => $method,
+                        'path'        => $normalizedPath,
+                        'description' => self::generateDescription($method, $normalizedPath, $name),
+                        'requestBody' => null,
+                        'detectedBy'  => 'static-scan',
+                    ];
+                }
+            }
+        } catch (\Exception $e) {
+            // Silent
+        }
+
+        return $endpoints;
+    }
+
+    public static function scanSlimRoutes($app = null): array
+    {
+        $endpoints = [];
+        $seen      = [];
+
+        try {
+            if (!$app) return $endpoints;
+
+            $routeCollector = $app->getRouteCollector();
+            $routes         = $routeCollector->getRoutes();
+
+            foreach ($routes as $route) {
+                $methods = $route->getMethods();
+                $pattern = $route->getPattern();
+
+                // Normalize Slim path {id} → :id
+                $normalizedPath = preg_replace('/\{([^}:]+):?[^}]*}/', ':$1', $pattern);
+
+                foreach ($methods as $method) {
+                    $method = strtoupper($method);
+                    if (in_array($method, ['HEAD', 'OPTIONS'])) continue;
+
+                    $key = $method . ':' . $normalizedPath;
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $endpoints[] = [
+                        'method'      => $method,
+                        'path'        => $normalizedPath,
+                        'description' => self::generateDescription($method, $normalizedPath, null),
+                        'requestBody' => null,
+                        'detectedBy'  => 'static-scan',
+                    ];
+                }
+            }
+        } catch (\Exception $e) {
+            // Silent
+        }
+
+        return $endpoints;
+    }
+
+    public static function scanCodeIgniterRoutes(): array
+    {
+        $endpoints = [];
+        $seen      = [];
+
+        try {
+            if (!class_exists('\CodeIgniter\Config\Services')) return $endpoints;
+
+            $routes     = \CodeIgniter\Config\Services::routes();
+            $routesList = $routes->getRoutes('*');
+
+            foreach ($routesList as $path => $handler) {
+                // CI4 getRoutes() returns ['GET /users' => 'Controller::method']
+                // The path key may include the method prefix or not
+                $method = 'GET'; // default
+
+                if (preg_match('/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+(.+)$/i', $path, $m)) {
+                    $method = strtoupper($m[1]);
+                    $path   = $m[2];
+                }
+
+                if (in_array($method, ['HEAD', 'OPTIONS'])) continue;
+
+                // Normalize CI4 path (:num), (:segment), (:any) → :id / :param
+                $normalizedPath = preg_replace('/\(:num\)/',    ':id',    $path);
+                $normalizedPath = preg_replace('/\(:segment\)/', ':param', $normalizedPath);
+                $normalizedPath = preg_replace('/\(:any\)/',    ':param', $normalizedPath);
+                $normalizedPath = '/' . ltrim($normalizedPath, '/');
+
+                $key = $method . ':' . $normalizedPath;
+                if (isset($seen[$key])) continue;
+                $seen[$key] = true;
+
+                $handlerName = is_string($handler) ? $handler : null;
+
+                $endpoints[] = [
+                    'method'      => $method,
+                    'path'        => $normalizedPath,
+                    'description' => self::generateDescription($method, $normalizedPath, $handlerName),
+                    'requestBody' => null,
+                    'detectedBy'  => 'static-scan',
+                ];
+            }
+        } catch (\Exception $e) {
+            // Silent
+        }
+
+        return $endpoints;
+    }
+
+
     // ── Request Body Extraction ───────────────────────────────────────────────
 
     /**
@@ -604,32 +796,178 @@ class BotVersionScanner
         $patterns = [];
         $seen     = [];
 
-        $dirsToScan = [
-            $cwd . '/pages',
-            $cwd . '/src/pages',
-            $cwd . '/app',
-            $cwd . '/src/app',
-            $cwd . '/src/routes',
-            $cwd . '/routes',
-            $cwd . '/app/routes',
-        ];
+        $candidateDirs = self::findAllFrontendDirs($cwd);
 
-        foreach ($dirsToScan as $dir) {
-            if (is_dir($dir)) {
-                self::walkFrontendDir($dir, [], $patterns, $seen);
+        foreach ($candidateDirs as $candidate) {
+            $dirsToScan = [
+                $candidate . '/pages',
+                $candidate . '/src/pages',
+                $candidate . '/app',
+                $candidate . '/src/app',
+                $candidate . '/src/routes',
+                $candidate . '/routes',
+                $candidate . '/app/routes',
+            ];
+
+            foreach ($dirsToScan as $dir) {
+                if (is_dir($dir)) {
+                    self::walkFrontendDir($dir, [], $patterns, $seen);
+                }
             }
-        }
 
-        // Also scan config-based routes (React Router, Vue Router, Angular)
-        $configPatterns = self::scanConfigBasedRoutes($cwd);
-        foreach ($configPatterns as $p) {
-            if (!isset($seen[$p['pattern']])) {
-                $seen[$p['pattern']] = true;
-                $patterns[] = $p;
+            // Also scan config-based routes (React Router, Vue Router, Angular)
+            $configPatterns = self::scanConfigBasedRoutes($candidate);
+            foreach ($configPatterns as $p) {
+                if (!isset($seen[$p['pattern']])) {
+                    $seen[$p['pattern']] = true;
+                    $patterns[] = $p;
+                }
             }
         }
 
         return $patterns;
+    }
+
+    private static function findAllFrontendDirs(string $cwd): array
+    {
+        $frontendIndicators = [
+            'next.config.js', 'next.config.ts',
+            'react-router.config.ts', 'react-router.config.js',
+            'vite.config.ts', 'vite.config.js',
+            'nuxt.config.ts', 'nuxt.config.js',
+            'svelte.config.js', 'svelte.config.ts',
+            'remix.config.js', 'remix.config.ts',
+            'angular.json',
+            'astro.config.mjs', 'astro.config.ts', 'astro.config.js',
+            'app.config.ts',
+        ];
+
+        $skipDirs = [
+            'node_modules', '.git', 'dist', 'build',
+            '.next', '.nuxt', 'coverage', 'vendor',
+            '__pycache__',
+        ];
+
+        // Common OS-level folders where scanning siblings would be dangerous
+        // If base_path() is a direct child of any of these, we skip sibling scanning
+        $unsafeParents = [
+            'Desktop', 'Documents', 'Downloads', 'Pictures', 'Videos', 'Music',
+            'home', 'users', 'Users', 'var', 'www', 'srv', 'opt', 'tmp',
+            'workspace', 'Workspace', 'projects', 'Projects', 'code', 'Code',
+            'sites', 'Sites', 'dev', 'Dev', 'work', 'Work',
+        ];
+
+        $found = [];
+
+        $isFrontendDir = function(string $dir) use ($frontendIndicators): bool {
+            // Check 1 — indicator files (most reliable)
+            foreach ($frontendIndicators as $indicator) {
+                if (file_exists($dir . '/' . $indicator)) return true;
+            }
+
+            // Check 2 — fallback: check package.json for frontend frameworks
+            try {
+                $pkgPath = $dir . '/package.json';
+                if (file_exists($pkgPath)) {
+                    $pkg = json_decode(file_get_contents($pkgPath), true);
+                    if (is_array($pkg)) {
+                        $deps = array_merge(
+                            $pkg['dependencies'] ?? [],
+                            $pkg['devDependencies'] ?? []
+                        );
+                        $frontendPackages = [
+                            'react', 'vue', 'angular', '@angular/core',
+                            'svelte', 'solid-js', 'preact', 'nuxt',
+                            '@remix-run/react', 'next', '@sveltejs/kit',
+                            'astro',
+                            '@solidjs/start',
+                            '@builder.io/qwik',
+                            '@builder.io/qwik-city',
+                        ];
+                        foreach ($frontendPackages as $package) {
+                            if (isset($deps[$package])) return true;
+                        }
+                    }
+                }
+            } catch (\Exception $e) {
+                // silent fail
+            }
+
+            return false;
+        };
+
+        // Always check cwd itself first — keeps simple projects working
+        if ($isFrontendDir($cwd)) {
+            $found[] = $cwd;
+        }
+
+        // Walk up max 1 level to find monorepo root
+        // then scan siblings only if parent looks like a real project root
+        $current = $cwd;
+        for ($i = 0; $i < 1; $i++) {
+            $parent = dirname($current);
+            if ($parent === $current) break; // reached filesystem root
+            $current = $parent;
+
+            // Skip sibling scanning if parent is a known OS-level or generic folder
+            $parentBasename = basename($current);
+            if (in_array($parentBasename, $unsafeParents)) break;
+
+            // Only scan siblings if parent has signs of being a project root
+            $parentHasPackageJson = file_exists($current . '/package.json');
+            $parentHasProjectFiles = (
+                file_exists($current . '/docker-compose.yml') ||
+                file_exists($current . '/docker-compose.yaml') ||
+                file_exists($current . '/.env') ||
+                file_exists($current . '/turbo.json') ||
+                file_exists($current . '/pnpm-workspace.yaml') ||
+                file_exists($current . '/composer.json')
+            );
+
+            if (!$parentHasPackageJson && !$parentHasProjectFiles) {
+                break;
+            }
+
+            $entries = @scandir($current);
+            if (!$entries) continue;
+
+            foreach ($entries as $entry) {
+                if ($entry === '.' || $entry === '..') continue;
+                if (in_array($entry, $skipDirs)) continue;
+
+                $sub = $current . '/' . $entry;
+                if ($sub === $cwd) continue; // already checked above
+                if (!is_dir($sub)) continue;
+
+                // Check direct subfolder
+                if ($isFrontendDir($sub) && !in_array($sub, $found)) {
+                    $found[] = $sub;
+                }
+
+                // Also check one level deeper (e.g. apps/web/frontend)
+                $subEntries = @scandir($sub);
+                if (!$subEntries) continue;
+
+                foreach ($subEntries as $subEntry) {
+                    if ($subEntry === '.' || $subEntry === '..') continue;
+                    if (in_array($subEntry, $skipDirs)) continue;
+
+                    $subSub = $sub . '/' . $subEntry;
+                    if (!is_dir($subSub)) continue;
+
+                    if ($isFrontendDir($subSub) && !in_array($subSub, $found)) {
+                        $found[] = $subSub;
+                    }
+                }
+            }
+        }
+
+        // If nothing found, fall back to cwd
+        if (empty($found)) {
+            $found[] = $cwd;
+        }
+
+        return $found;
     }
 
     private static function walkFrontendDir(string $dir, array $segments, array &$patterns, array &$seen): void
@@ -660,16 +998,20 @@ class BotVersionScanner
             }
 
             // Only process known frontend file types
-            if (!preg_match('/\.(js|ts|jsx|tsx|vue|svelte)$/', $file)) continue;
+            if (!preg_match('/\.(js|ts|jsx|tsx|vue|svelte|astro)$/', $file)) continue;
             if (str_starts_with($file, '_')) continue;
 
-            $routeName = preg_replace('/\.(js|ts|jsx|tsx|vue|svelte)$/', '', $file);
+            $routeName = preg_replace('/\.(js|ts|jsx|tsx|vue|svelte|astro)$/', '', $file);
 
             // Skip non-page files in Next.js App Router
             if (in_array($routeName, ['layout', 'loading', 'error', 'template', 'not-found'])) continue;
 
             // SvelteKit: only +page files are pages
             if (str_starts_with($routeName, '+') && $routeName !== '+page') continue;
+
+            // Qwik City: only index files are pages (index.tsx, index.astro etc.)
+            // Files like layout.tsx, error.tsx are not pages
+            if (in_array($routeName, ['layout', 'error', 'plugin', 'entry.server', 'entry.client'])) continue;
 
             // Remix: dot-separated filenames like $projectId.dashboard.tsx
             $isRemixRoute = str_contains($routeName, '.') && !str_starts_with($routeName, '+');
