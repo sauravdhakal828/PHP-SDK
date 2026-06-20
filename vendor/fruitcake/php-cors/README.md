@@ -15,6 +15,7 @@ http-{foundation,kernel} using application. It attempts to implement the
 [W3C Recommendation]: http://www.w3.org/TR/cors/
 
 > Note: This is a standalone fork of https://github.com/asm89/stack-cors and is compatible with the options for CorsService.
+
 ## Installation
 
 Require `fruitcake/php-cors` using composer.
@@ -23,21 +24,20 @@ Require `fruitcake/php-cors` using composer.
 
 This package can be used as a library. You can use it in your framework using:
 
- - [Stack middleware](http://stackphp.com/): https://github.com/asm89/stack-cors
- - [Laravel](https://laravel.com): https://github.com/fruitcake/laravel-cors
- 
+- [Stack middleware](http://stackphp.com/): https://github.com/asm89/stack-cors
+- [Laravel](https://laravel.com): https://github.com/fruitcake/laravel-cors
 
 ### Options
 
-| Option                 | Description                                                | Default value |
-|------------------------|------------------------------------------------------------|---------------|
-| allowedMethods         | Matches the request method.                                | `[]`          |
-| allowedOrigins         | Matches the request origin.                                | `[]`          |
-| allowedOriginsPatterns | Matches the request origin with `preg_match`.              | `[]`          |
-| allowedHeaders         | Sets the Access-Control-Allow-Headers response header.     | `[]`          |
-| exposedHeaders         | Sets the Access-Control-Expose-Headers response header.    | `[]`          |
-| maxAge                 | Sets the Access-Control-Max-Age response header.           | `0`           |
-| supportsCredentials    | Sets the Access-Control-Allow-Credentials header.          | `false`       |
+| Option                 | Description                                             | Default value |
+| ---------------------- | ------------------------------------------------------- | ------------- |
+| allowedMethods         | Matches the request method.                             | `[]`          |
+| allowedOrigins         | Matches the request origin.                             | `[]`          |
+| allowedOriginsPatterns | Matches the request origin with `preg_match`.           | `[]`          |
+| allowedHeaders         | Sets the Access-Control-Allow-Headers response header.  | `[]`          |
+| exposedHeaders         | Sets the Access-Control-Expose-Headers response header. | `[]`          |
+| maxAge                 | Sets the Access-Control-Max-Age response header.        | `0`           |
+| supportsCredentials    | Sets the Access-Control-Allow-Credentials header.       | `false`       |
 
 The _allowedMethods_ and _allowedHeaders_ options are case-insensitive.
 

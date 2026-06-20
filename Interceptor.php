@@ -42,9 +42,16 @@ class BotVersionInterceptor
 
             if (!$apiPrefix || str_starts_with($path, $apiPrefix)) {
                 $normalizedPath = $this->normalizePath($path);
-                $bodyStructure  = $method !== 'GET'
+                $bodyStructure = $method !== 'GET'
                     ? $this->buildBodyStructure($request->except(['_token', '_method']))
                     : null;
+                // tRPC GET: input is in URL query param, not body
+                if (!$bodyStructure) {
+                    $trpcBody = $this->extractTrpcGetInput($path, $request->getQueryString() ?? '');
+                    if ($trpcBody) {
+                        $bodyStructure = $this->buildBodyStructure($trpcBody);
+                    }
+                }
 
                 $this->maybeReport($method, $normalizedPath, $bodyStructure, $response->getStatusCode());
             }
@@ -103,6 +110,13 @@ class BotVersionInterceptor
 
                 $bodyStructure = $this->buildBodyStructure($body);
             }
+            // tRPC GET: input is in URL query param, not body
+            if (!$bodyStructure) {
+                $trpcBody = $this->extractTrpcGetInput($path, $request->getQueryString() ?? '');
+                if ($trpcBody) {
+                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                }
+            }
 
             $this->maybeReport($method, $normalizedPath, $bodyStructure, $response->getStatusCode());
 
@@ -150,6 +164,14 @@ class BotVersionInterceptor
                 }
 
                 $bodyStructure = $this->buildBodyStructure($body);
+            }
+            // tRPC GET: input is in URL query param, not body
+            if (!$bodyStructure) {
+                $queryString = $request->getUri()->getQuery();
+                $trpcBody = $this->extractTrpcGetInput($path, $queryString);
+                if ($trpcBody) {
+                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                }
             }
 
             $this->maybeReport($method, $normalizedPath, $bodyStructure, $response->getStatusCode());
@@ -206,6 +228,13 @@ class BotVersionInterceptor
 
                 $bodyStructure = $this->buildBodyStructure($body);
             }
+            // tRPC GET: input is in URL query param, not body
+            if (!$bodyStructure) {
+                $trpcBody = $this->extractTrpcGetInput($path, $_SERVER['QUERY_STRING'] ?? '');
+                if ($trpcBody) {
+                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                }
+            }
 
             $statusCode = $response->getStatusCode();
             $this->maybeReport($method, $normalizedPath, $bodyStructure, $statusCode);
@@ -248,6 +277,13 @@ class BotVersionInterceptor
 
                 $bodyStructure = $this->buildBodyStructure($body);
             }
+            // tRPC GET: input is in URL query param, not body
+            if (!$bodyStructure) {
+                $trpcBody = $this->extractTrpcGetInput($path, $_SERVER['QUERY_STRING'] ?? '');
+                if ($trpcBody) {
+                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                }
+            }
 
             // Plain PHP has no response object at shutdown — we report regardless
             // of status since we can't check it. http_response_code() gives us the
@@ -258,6 +294,57 @@ class BotVersionInterceptor
         } catch (\Exception $e) {
             // Silent
         }
+    }
+
+    private function extractTrpcGetInput(string $path, string $queryString): ?array
+    {
+        // tRPC GET requests send their input as a URL-encoded JSON query parameter
+        // called 'input'. Only activates for tRPC paths — safe for all REST endpoints.
+        if (strpos($path, '/trpc/') === false) return null;
+        if (empty($queryString) || strpos($queryString, 'input=') === false) return null;
+
+        try {
+            parse_str($queryString, $params);
+            $inputParam = $params['input'] ?? null;
+            if (!$inputParam) return null;
+
+            $decoded = json_decode(urldecode($inputParam), true);
+            if (!is_array($decoded)) return null;
+
+            $keys = array_keys($decoded);
+
+            // Format 1 — batched: { "0": { "json": {...} }, "1": { "json": {...} } }
+            $isBatch = count($keys) > 0 && count(array_filter($keys, 'is_numeric')) === count($keys);
+            if ($isBatch) {
+                $merged = [];
+                foreach ($keys as $k) {
+                    $entry = $decoded[$k];
+                    if (is_array($entry)) {
+                        // Unwrap { json: {...} } envelope if present
+                        $unwrapped = (isset($entry['json']) && is_array($entry['json']))
+                            ? $entry['json']
+                            : $entry;
+                        $merged = array_merge($merged, $unwrapped);
+                    }
+                }
+                return !empty($merged) ? $merged : null;
+            }
+
+            // Format 2 — single with superjson: { "json": {...}, "meta": {...} }
+            if (isset($decoded['json']) && is_array($decoded['json'])) {
+                return $decoded['json'];
+            }
+
+            // Format 3 — already unwrapped: { "group": {...}, "limit": 10 }
+            if (!isset($decoded['meta']) && !isset($decoded['json'])) {
+                return $decoded;
+            }
+
+        } catch (\Exception $e) {
+            // Silent
+        }
+
+        return null;
     }
 
     // =========================================================================
@@ -347,14 +434,33 @@ class BotVersionInterceptor
 
             if ($isSensitive) {
                 $structure[$key] = '[redacted]';
-            } elseif (is_array($val)) {
-                $structure[$key] = 'array';
             } elseif (is_null($val)) {
                 $structure[$key] = 'null';
             } elseif (is_bool($val)) {
                 $structure[$key] = 'boolean';
             } elseif (is_int($val) || is_float($val)) {
                 $structure[$key] = 'number';
+            } elseif (is_array($val) && array_keys($val) !== range(0, count($val) - 1)) {
+                // Associative array = object — capture one level of nested properties
+                // so agent can reconstruct shape e.g. group: { teamId: null, parentId: null }
+                $nestedProps = [];
+                foreach ($val as $nk => $nv) {
+                    if (is_null($nv)) {
+                        $nestedProps[$nk] = ['type' => 'string'];
+                    } elseif (is_bool($nv)) {
+                        $nestedProps[$nk] = ['type' => 'boolean'];
+                    } elseif (is_int($nv) || is_float($nv)) {
+                        $nestedProps[$nk] = ['type' => 'number'];
+                    } else {
+                        $nestedProps[$nk] = ['type' => 'string'];
+                    }
+                }
+                $structure[$key] = !empty($nestedProps)
+                    ? ['type' => 'object', 'properties' => $nestedProps]
+                    : 'object';
+            } elseif (is_array($val)) {
+                // Sequential array = plain array
+                $structure[$key] = 'array';
             } else {
                 $structure[$key] = 'string';
             }
@@ -368,10 +474,16 @@ class BotVersionInterceptor
         if (empty($bodyStructure)) return null;
 
         $properties = [];
-        foreach ($bodyStructure as $key => $type) {
-            $properties[$key] = [
-                'type' => ($type === 'null' || $type === '[redacted]') ? 'string' : $type,
-            ];
+        foreach ($bodyStructure as $key => $typeOrObj) {
+            // Nested object captured with properties
+            if (is_array($typeOrObj) && isset($typeOrObj['type'])) {
+                $properties[$key] = $typeOrObj;
+            // Simple type string
+            } elseif ($typeOrObj === 'null' || $typeOrObj === '[redacted]') {
+                $properties[$key] = ['type' => 'string'];
+            } else {
+                $properties[$key] = ['type' => $typeOrObj];
+            }
         }
 
         return ['type' => 'object', 'properties' => $properties];
