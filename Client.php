@@ -59,19 +59,20 @@ class BotVersionClient
         }
     }
 
-    public function registerRoutePatterns(array $patterns): void
+    public function registerRoutePatterns(array $patterns, ?array $classification = null): void
     {
-        if (empty($patterns)) return;
+        if (empty($patterns) && !$classification) return;
 
         try {
             $this->post('/api/sdk/register-route-patterns', [
-                'workspaceKey' => $this->apiKey,
-                'patterns'     => $patterns,
+                'workspaceKey'   => $this->apiKey,
+                'patterns'       => $patterns,
+                'classification' => $classification,
             ]);
         } catch (\Exception $e) {
         }
     }
-
+    
     // ── Update single endpoint (runtime) ─────────────────────────────────────
 
     public function updateEndpoint(array $endpoint): void

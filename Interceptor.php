@@ -32,10 +32,22 @@ class BotVersionInterceptor
 
     public function handle($request, \Closure $next)
     {
-        $response = $next($request);
-
         $path   = '/' . ltrim($request->path(), '/');
         $method = strtoupper($request->method());
+
+        // ── Scan trigger from BotVersion dashboard ────────────────────────
+        if ($path === '/__botversion/scan' && $method === 'POST') {
+            $providedKey = $request->header('x-botversion-scan-key', '');
+            $result      = $this->tryHandleScanTrigger($providedKey);
+
+            return response()->json(array_filter([
+                'success' => $result['success'],
+                'result'  => $result['result'] ?? null,
+                'error'   => $result['error'] ?? null,
+            ], fn($v) => $v !== null), $result['status']);
+        }
+
+        $response = $next($request);
 
         if (!$this->shouldIgnore($path)) {
             $apiPrefix = $this->options['api_prefix'] ?? null;
@@ -58,6 +70,49 @@ class BotVersionInterceptor
         }
 
         return $response;
+    }
+
+    // =========================================================================
+    // ── SYMFONY — kernel.request event listener (scan trigger only) ───────────
+    // =========================================================================
+
+    // Called by BotVersion::bootSymfony() via:
+    //   $dispatcher->addListener('kernel.request', [$interceptor, 'onKernelRequest'])
+    //
+    // Fires before routing, so it's the only place we can safely answer the
+    // /__botversion/scan trigger — by the time kernel.response fires, Symfony
+    // has already tried (and likely failed) to route that path.
+
+    public function onKernelRequest($event): void
+    {
+        try {
+            if (!method_exists($event, 'getRequest') || !method_exists($event, 'setResponse')) {
+                return;
+            }
+            if (method_exists($event, 'isMainRequest') && !$event->isMainRequest()) {
+                return;
+            }
+
+            $request = $event->getRequest();
+            $path    = $request->getPathInfo();
+            $method  = strtoupper($request->getMethod());
+
+            if ($path !== '/__botversion/scan' || $method !== 'POST') return;
+
+            $providedKey = $request->headers->get('x-botversion-scan-key', '');
+            $result      = $this->tryHandleScanTrigger($providedKey);
+
+            $response = new \Symfony\Component\HttpFoundation\JsonResponse(array_filter([
+                'success' => $result['success'],
+                'result'  => $result['result'] ?? null,
+                'error'   => $result['error'] ?? null,
+            ], fn($v) => $v !== null), $result['status']);
+
+            $event->setResponse($response);
+
+        } catch (\Exception $e) {
+            // Silent — never break the app
+        }
     }
 
     // =========================================================================
@@ -136,13 +191,28 @@ class BotVersionInterceptor
 
     public function processSlim($request, $handler)
     {
+        $path   = $request->getUri()->getPath();
+        $method = strtoupper($request->getMethod());
+
+        // ── Scan trigger from BotVersion dashboard ────────────────────────
+        if ($path === '/__botversion/scan' && $method === 'POST') {
+            $providedKey = $request->getHeaderLine('x-botversion-scan-key');
+            $result      = $this->tryHandleScanTrigger($providedKey);
+
+            $factory  = new \Slim\Psr7\Factory\ResponseFactory();
+            $response = $factory->createResponse($result['status']);
+            $response->getBody()->write(json_encode(array_filter([
+                'success' => $result['success'],
+                'result'  => $result['result'] ?? null,
+                'error'   => $result['error'] ?? null,
+            ], fn($v) => $v !== null)));
+            return $response->withHeader('Content-Type', 'application/json');
+        }
+
         // Let the app handle the request first
         $response = $handler->handle($request);
 
         try {
-            $path   = $request->getUri()->getPath();
-            $method = strtoupper($request->getMethod());
-
             if ($this->shouldIgnore($path)) return $response;
 
             $apiPrefix = $this->options['api_prefix'] ?? null;
@@ -181,6 +251,51 @@ class BotVersionInterceptor
         }
 
         return $response;
+    }
+
+    // =========================================================================
+    // ── CODEIGNITER 4 — pre_system event (scan trigger only) ──────────────────
+    // =========================================================================
+
+    // Called by BotVersion::bootCodeIgniter() via:
+    //   Events::on('pre_system', function() use ($interceptor) {
+    //       $interceptor->handleCodeIgniterScanCheck();
+    //   })
+    //
+    // Fires before routing/the controller runs, so it's the only place we can
+    // answer the /__botversion/scan trigger — by post_controller time, CI4 has
+    // already tried (and likely failed) to route that path. CI4's request
+    // services aren't guaranteed ready this early, so we read directly from
+    // PHP superglobals instead.
+
+    public function handleCodeIgniterScanCheck(): void
+    {
+        try {
+            $path   = '/' . ltrim(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH), '/');
+            $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+
+            if ($path !== '/__botversion/scan' || $method !== 'POST') return;
+
+            $headers = function_exists('getallheaders') ? getallheaders() : [];
+            $providedKey = $headers['x-botversion-scan-key']
+                ?? $headers['X-Botversion-Scan-Key']
+                ?? $_SERVER['HTTP_X_BOTVERSION_SCAN_KEY']
+                ?? '';
+
+            $result = $this->tryHandleScanTrigger($providedKey);
+
+            http_response_code($result['status']);
+            header('Content-Type: application/json');
+            echo json_encode(array_filter([
+                'success' => $result['success'],
+                'result'  => $result['result'] ?? null,
+                'error'   => $result['error'] ?? null,
+            ], fn($v) => $v !== null));
+            exit;
+
+        } catch (\Exception $e) {
+            // Silent
+        }
     }
 
     // =========================================================================
@@ -242,6 +357,42 @@ class BotVersionInterceptor
         } catch (\Exception $e) {
             // Silent
         }
+    }
+
+    // =========================================================================
+    // ── PLAIN PHP FALLBACK — scan trigger check ───────────────────────────────
+    // =========================================================================
+
+    // Called by BotVersion::bootFallback() immediately, before the shutdown
+    // hook is registered. Plain PHP has no persistent process, so this is the
+    // only moment the SDK can answer the /__botversion/scan trigger — by
+    // shutdown time the script has already finished running.
+    // Returns true if this request was the scan trigger (caller should exit).
+
+    public function checkAndHandleScanTrigger(): bool
+    {
+        $path   = '/' . ltrim(parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH), '/');
+        $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+
+        if ($path !== '/__botversion/scan' || $method !== 'POST') return false;
+
+        $headers = function_exists('getallheaders') ? getallheaders() : [];
+        $providedKey = $headers['x-botversion-scan-key']
+            ?? $headers['X-Botversion-Scan-Key']
+            ?? $_SERVER['HTTP_X_BOTVERSION_SCAN_KEY']
+            ?? '';
+
+        $result = $this->tryHandleScanTrigger($providedKey);
+
+        http_response_code($result['status']);
+        header('Content-Type: application/json');
+        echo json_encode(array_filter([
+            'success' => $result['success'],
+            'result'  => $result['result'] ?? null,
+            'error'   => $result['error'] ?? null,
+        ], fn($v) => $v !== null));
+
+        return true;
     }
 
     // =========================================================================
@@ -350,6 +501,27 @@ class BotVersionInterceptor
     // =========================================================================
     // ── SHARED HELPERS ────────────────────────────────────────────────────────
     // =========================================================================
+
+    // Verifies the scan-trigger secret and runs the scan if valid.
+    // Shared by every framework entry point below.
+    private function tryHandleScanTrigger(string $providedKey): array
+    {
+        if (
+            !empty($this->options['scan_secret']) &&
+            $providedKey === $this->options['scan_secret'] &&
+            isset($this->options['on_scan_requested']) &&
+            is_callable($this->options['on_scan_requested'])
+        ) {
+            try {
+                $result = ($this->options['on_scan_requested'])();
+                return ['success' => true, 'result' => $result, 'status' => 200];
+            } catch (\Exception $e) {
+                return ['success' => false, 'error' => $e->getMessage(), 'status' => 500];
+            }
+        }
+
+        return ['success' => false, 'error' => 'Unauthorized', 'status' => 401];
+    }
 
     // Deduplicates reports — same method + path + body shape is only reported once
     // per process lifetime. This prevents hammering the platform on every request.
@@ -491,25 +663,23 @@ class BotVersionInterceptor
 
     private function reportAsync(string $method, string $path, ?array $jsonSchema): void
     {
-        $payload = json_encode([
-            'workspaceKey' => $this->client->getApiKey(),
-            'method'       => $method,
-            'path'         => $path,
-            'requestBody'  => $jsonSchema,
-            'detectedBy'   => 'runtime',
-        ]);
+        // If running under PHP-FPM, send the response to the visitor first,
+        // then do the reporting call — the visitor doesn't wait on it at all.
+        // Falls back to a short-timeout blocking call everywhere else (plain
+        // PHP / CLI / servers without FPM), same trade-off as before.
+        if (function_exists('fastcgi_finish_request')) {
+            @fastcgi_finish_request();
+        }
 
-        $url = $this->client->getPlatformUrl() . '/api/sdk/update-endpoint';
-
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_POST           => true,
-            CURLOPT_POSTFIELDS     => $payload,
-            CURLOPT_TIMEOUT_MS     => 500,
-            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
-        ]);
-        curl_exec($ch);
-        curl_close($ch);
+        try {
+            $this->client->updateEndpoint([
+                'method'      => $method,
+                'path'        => $path,
+                'requestBody' => $jsonSchema,
+                'detectedBy'  => 'runtime',
+            ]);
+        } catch (\Exception $e) {
+            // Silent — never break the app
+        }
     }
 }

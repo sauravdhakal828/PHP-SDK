@@ -18,9 +18,6 @@
       "BotVersion.php"
     ]
   },
-  "bin": [
-    "bin/botversion-init.php"
-  ],
   "keywords": [
     "botversion",
     "api",

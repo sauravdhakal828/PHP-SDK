@@ -12,6 +12,62 @@ class BotVersion
     private static $options     = [];
 
     /**
+     * PHP SDKs only ever run on a backend server — there's no such thing
+     * as a PHP frontend project. So unlike the JS SDK, this is a simple
+     * two-way classification: either a supported backend framework was
+     * detected, or it wasn't.
+     */
+    private static function classifyInstallation(?string $framework): string
+    {
+        return $framework ? 'backend-only' : 'unknown';
+    }
+
+    /**
+     * Run a full scan (backend endpoints + frontend routes) and report results.
+     * This used to run automatically on boot for each framework. Now it only
+     * runs when the BotVersion dashboard's "Scan" button sends a request to
+     * this SDK's scan-trigger endpoint (see Interceptor.php). This fixes scans
+     * not happening on redeploys where there's no reliable "boot" moment to
+     * hook into — and, for plain-PHP/PHP-FPM style deployments, no persistent
+     * process at all.
+     */
+    private static function runFullScan(string $framework, bool $debug, $slimApp = null): array
+    {
+        $result = [
+            'endpointCount'    => 0,
+            'routeCount'       => 0,
+            'projectType'      => null,
+            'detectedBackend'  => $framework,
+            'detectedFrontend' => null,
+            'sdkLanguage'      => 'php',
+        ];
+
+        try {
+            $endpoints = [];
+            switch ($framework) {
+                case 'laravel':     $endpoints = BotVersionScanner::scanLaravelRoutes(); break;
+                case 'lumen':       $endpoints = BotVersionScanner::scanLumenRoutes(); break;
+                case 'symfony':     $endpoints = BotVersionScanner::scanSymfonyRoutes(self::$options['symfony_kernel'] ?? null); break;
+                case 'slim':        $endpoints = BotVersionScanner::scanSlimRoutes($slimApp); break;
+                case 'codeigniter': $endpoints = BotVersionScanner::scanCodeIgniterRoutes(); break;
+            }
+
+            $result['endpointCount'] = count($endpoints);
+
+            if (!empty($endpoints)) {
+                self::$client->registerEndpoints($endpoints);
+            }
+        } catch (\Exception $e) {
+            if ($debug) error_log('[botversion] Scan failed: ' . $e->getMessage());
+        }
+
+        $result['detectedFrontend'] = null;
+        $result['projectType']      = self::classifyInstallation($framework);
+
+        return $result;
+    }
+
+    /**
      * Initialize the BotVersion SDK.
      *
      * Laravel/Lumen  — in AppServiceProvider::boot():
@@ -38,14 +94,37 @@ class BotVersion
         if (self::$initialized) {
             if (!self::$client) return;
 
-            // Re-attach middleware on framework reload (Laravel/Lumen only)
+            // Re-attach interceptor on framework reload
             $framework = self::detectFramework();
-            if ($framework === 'laravel' || $framework === 'lumen') {
-                self::attachLaravelMiddleware([
-                    'exclude'    => self::$options['exclude'] ?? [],
-                    'api_prefix' => self::$options['api_prefix'] ?? null,
-                    'debug'      => self::$options['debug'] ?? false,
-                ]);
+            $debug     = self::$options['debug'] ?? false;
+            $slimApp   = self::$options['slim_app'] ?? null;
+
+            $interceptorOptions = [
+                'exclude'           => self::$options['exclude'] ?? [],
+                'api_prefix'        => self::$options['api_prefix'] ?? null,
+                'debug'             => $debug,
+                'scan_secret'       => self::$client->getApiKey(),
+                'on_scan_requested' => function () use ($framework, $debug, $slimApp) {
+                    return self::runFullScan($framework, $debug, $slimApp);
+                },
+            ];
+
+            switch ($framework) {
+                case 'laravel':
+                    self::attachLaravelMiddleware($interceptorOptions);
+                    break;
+                case 'lumen':
+                    self::attachLumenMiddleware($interceptorOptions);
+                    break;
+                case 'symfony':
+                    self::bootSymfony($interceptorOptions, $debug);
+                    break;
+                case 'slim':
+                    self::bootSlim($slimApp, $interceptorOptions, $debug);
+                    break;
+                case 'codeigniter':
+                    self::bootCodeIgniter($interceptorOptions, $debug);
+                    break;
             }
             return;
         }
@@ -64,11 +143,16 @@ class BotVersion
         ]);
 
         $framework = self::detectFramework($options);
+        $slimApp   = $options['slim_app'] ?? null;
 
         $interceptorOptions = [
-            'exclude'    => $options['exclude'] ?? [],
-            'api_prefix' => $options['api_prefix'] ?? null,
-            'debug'      => $debug,
+            'exclude'           => $options['exclude'] ?? [],
+            'api_prefix'        => $options['api_prefix'] ?? null,
+            'debug'             => $debug,
+            'scan_secret'       => $apiKey,
+            'on_scan_requested' => function () use ($framework, $debug, $slimApp) {
+                return self::runFullScan($framework, $debug, $slimApp);
+            },
         ];
 
         // ── Attach interceptor per framework ──────────────────────────────────
@@ -76,12 +160,10 @@ class BotVersion
 
             case 'laravel':
                 self::attachLaravelMiddleware($interceptorOptions);
-                self::bootLaravel($debug);
                 break;
 
             case 'lumen':
                 self::attachLumenMiddleware($interceptorOptions);
-                self::bootLumen($debug);
                 break;
 
             case 'symfony':
@@ -191,26 +273,6 @@ class BotVersion
         }
     }
 
-    private static function bootLaravel(bool $debug): void
-    {
-        if (!function_exists('app') || !method_exists(app(), 'booted')) return;
-
-        app()->booted(function () use ($debug) {
-            try {
-                $endpoints = BotVersionScanner::scanLaravelRoutes();
-                if (!empty($endpoints)) {
-                    self::$client->registerEndpoints($endpoints);
-                }
-                $patterns = BotVersionScanner::scanFrontendRoutes();
-                if (!empty($patterns)) {
-                    self::$client->registerRoutePatterns($patterns);
-                }
-            } catch (\Exception $e) {
-                if ($debug) error_log('[botversion:laravel] Scan failed: ' . $e->getMessage());
-            }
-        });
-    }
-
     // =========================================================================
     // ── LUMEN ─────────────────────────────────────────────────────────────────
     // =========================================================================
@@ -227,80 +289,33 @@ class BotVersion
         }
     }
 
-    private static function bootLumen(bool $debug): void
-    {
-        // Lumen does not have an app()->booted() hook, so we use a shutdown
-        // function to do the static scan after the app has fully bootstrapped.
-        register_shutdown_function(function () use ($debug) {
-            // Only run once — guard with a static flag
-            static $ran = false;
-            if ($ran) return;
-            $ran = true;
-
-            try {
-                $endpoints = BotVersionScanner::scanLumenRoutes();
-                if (!empty($endpoints)) {
-                    self::$client->registerEndpoints($endpoints);
-                }
-                $patterns = BotVersionScanner::scanFrontendRoutes();
-                if (!empty($patterns)) {
-                    self::$client->registerRoutePatterns($patterns);
-                }
-            } catch (\Exception $e) {
-                if ($debug) error_log('[botversion:lumen] Scan failed: ' . $e->getMessage());
-            }
-        });
-    }
-
     // =========================================================================
     // ── SYMFONY ───────────────────────────────────────────────────────────────
     // =========================================================================
 
     private static function bootSymfony(array $interceptorOptions, bool $debug): void
     {
-        // Register a global event subscriber that:
-        //   1. Intercepts every request/response pair (runtime scan)
-        //   2. Does a one-time static route scan on the first request
+        // Register a global event subscriber that intercepts every
+        // request/response pair for runtime detection, plus an early
+        // kernel.request listener that can answer the on-demand scan
+        // trigger from the BotVersion dashboard before routing even runs.
         try {
-            // We attach via PHP's output buffering + shutdown because Symfony's
-            // event dispatcher requires a booted kernel reference we may not
-            // have here. The Interceptor handles the per-request logic.
             // Users who have a kernel reference can pass it via options['symfony_kernel'].
             $kernel = self::$options['symfony_kernel'] ?? null;
 
             if ($kernel && method_exists($kernel, 'getContainer')) {
-                // Full Symfony integration — attach via event dispatcher
                 $container  = $kernel->getContainer();
                 $dispatcher = $container->get('event_dispatcher');
                 $interceptor = new BotVersionInterceptor(self::$client, $interceptorOptions);
+                $dispatcher->addListener(
+                    'kernel.request',
+                    [$interceptor, 'onKernelRequest']
+                );
                 $dispatcher->addListener(
                     'kernel.response',
                     [$interceptor, 'onKernelResponse']
                 );
             }
-
-            // Static scan — runs once via shutdown
-            register_shutdown_function(function () use ($debug) {
-                static $ran = false;
-                if ($ran) return;
-                $ran = true;
-
-                try {
-                    $endpoints = BotVersionScanner::scanSymfonyRoutes(
-                        self::$options['symfony_kernel'] ?? null
-                    );
-                    if (!empty($endpoints)) {
-                        self::$client->registerEndpoints($endpoints);
-                    }
-                    $patterns = BotVersionScanner::scanFrontendRoutes();
-                    if (!empty($patterns)) {
-                        self::$client->registerRoutePatterns($patterns);
-                    }
-                } catch (\Exception $e) {
-                    if ($debug) error_log('[botversion:symfony] Scan failed: ' . $e->getMessage());
-                }
-            });
-
         } catch (\Exception $e) {
             if ($debug) error_log('[botversion:symfony] Boot failed: ' . $e->getMessage());
         }
@@ -318,27 +333,6 @@ class BotVersion
                 $interceptor = new BotVersionInterceptor(self::$client, $interceptorOptions);
                 $slimApp->add([$interceptor, 'processSlim']);
             }
-
-            // Static scan via shutdown
-            register_shutdown_function(function () use ($slimApp, $debug) {
-                static $ran = false;
-                if ($ran) return;
-                $ran = true;
-
-                try {
-                    $endpoints = BotVersionScanner::scanSlimRoutes($slimApp);
-                    if (!empty($endpoints)) {
-                        self::$client->registerEndpoints($endpoints);
-                    }
-                    $patterns = BotVersionScanner::scanFrontendRoutes();
-                    if (!empty($patterns)) {
-                        self::$client->registerRoutePatterns($patterns);
-                    }
-                } catch (\Exception $e) {
-                    if ($debug) error_log('[botversion:slim] Scan failed: ' . $e->getMessage());
-                }
-            });
-
         } catch (\Exception $e) {
             if ($debug) error_log('[botversion:slim] Boot failed: ' . $e->getMessage());
         }
@@ -352,35 +346,19 @@ class BotVersion
     {
         try {
             // CodeIgniter 4 uses Events for hooks.
-            // We hook into post_controller to intercept after the controller runs.
+            // pre_system fires before routing — early enough to answer the
+            // scan trigger. post_controller still handles runtime interception.
             if (class_exists('\CodeIgniter\Events\Events')) {
                 $interceptor = new BotVersionInterceptor(self::$client, $interceptorOptions);
+
+                \CodeIgniter\Events\Events::on('pre_system', function () use ($interceptor) {
+                    $interceptor->handleCodeIgniterScanCheck();
+                });
 
                 \CodeIgniter\Events\Events::on('post_controller', function () use ($interceptor) {
                     $interceptor->handleCodeIgniter();
                 });
             }
-
-            // Static scan via shutdown
-            register_shutdown_function(function () use ($debug) {
-                static $ran = false;
-                if ($ran) return;
-                $ran = true;
-
-                try {
-                    $endpoints = BotVersionScanner::scanCodeIgniterRoutes();
-                    if (!empty($endpoints)) {
-                        self::$client->registerEndpoints($endpoints);
-                    }
-                    $patterns = BotVersionScanner::scanFrontendRoutes();
-                    if (!empty($patterns)) {
-                        self::$client->registerRoutePatterns($patterns);
-                    }
-                } catch (\Exception $e) {
-                    if ($debug) error_log('[botversion:codeigniter] Scan failed: ' . $e->getMessage());
-                }
-            });
-
         } catch (\Exception $e) {
             if ($debug) error_log('[botversion:codeigniter] Boot failed: ' . $e->getMessage());
         }
@@ -392,12 +370,23 @@ class BotVersion
 
     private static function bootFallback(array $interceptorOptions, bool $debug): void
     {
-        // No static scan possible — we don't know how routes are defined.
+        $interceptor = new BotVersionInterceptor(self::$client, $interceptorOptions);
+
+        // Check for the scan trigger immediately — plain PHP has no
+        // persistent process, so this is the only moment the SDK gets
+        // to answer it. If matched, respond and stop here.
+        try {
+            if ($interceptor->checkAndHandleScanTrigger()) {
+                exit;
+            }
+        } catch (\Exception $e) {
+            if ($debug) error_log('[botversion:fallback] Scan check failed: ' . $e->getMessage());
+        }
+
         // We use output buffering + shutdown to capture the current request
         // and report it as a runtime-detected endpoint.
-        register_shutdown_function(function () use ($interceptorOptions, $debug) {
+        register_shutdown_function(function () use ($interceptor, $debug) {
             try {
-                $interceptor = new BotVersionInterceptor(self::$client, $interceptorOptions);
                 $interceptor->handlePlainPhp();
             } catch (\Exception $e) {
                 if ($debug) error_log('[botversion:fallback] Failed: ' . $e->getMessage());
