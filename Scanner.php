@@ -787,4 +787,409 @@ class BotVersionScanner
         $verb = $verbs[$method] ?? $method;
         return "{$verb} {$resource}";
     }
+
+    // =========================================================================
+    // ── STATIC (BUILD-TIME) SCANNING — no live app object required ───────────
+    // =========================================================================
+    // Used by the CLI (bin/scan-endpoints.php) since there's no running
+    // server/framework boot at build time (Docker build step, CI pipeline,
+    // serverless-style deploys). Parses route files directly as plain text
+    // instead of introspecting a live router.
+
+    private const STATIC_SKIP_DIRS = [
+        'vendor', '.git', 'node_modules', 'storage', 'cache',
+        'tests', 'var', 'bootstrap/cache',
+    ];
+
+    /**
+     * Entry point used by the CLI script. Dispatches to the right
+     * framework-specific static scanner.
+     */
+    public static function scanRoutesStatic(string $cwd, string $framework): array
+    {
+        switch ($framework) {
+            case 'laravel':
+                return self::scanLaravelRoutesStatic($cwd);
+            case 'lumen':
+                return self::scanLumenRoutesStatic($cwd);
+            case 'symfony':
+                return self::scanSymfonyRoutesStatic($cwd);
+            case 'slim':
+                return self::scanSlimRoutesStatic($cwd);
+            case 'codeigniter':
+                return self::scanCodeIgniterRoutesStatic($cwd);
+            default:
+                return [];
+        }
+    }
+
+    /**
+     * Detects the backend framework from composer.json's "require" (and
+     * "require-dev") sections, since there's no live app instance to
+     * introspect at build time. This is the PHP equivalent of the JS SDK
+     * reading package.json and the Python SDK reading requirements.txt.
+     */
+    public static function detectFrameworkFromComposer(string $cwd): ?string
+    {
+        $composerPath = $cwd . '/composer.json';
+        if (!file_exists($composerPath)) return null;
+
+        $content = @file_get_contents($composerPath);
+        if ($content === false) return null;
+
+        $data = json_decode($content, true);
+        if (!is_array($data)) return null;
+
+        $deps = array_merge($data['require'] ?? [], $data['require-dev'] ?? []);
+        $depNamesLower = array_map('strtolower', array_keys($deps));
+
+        $frameworkPackages = [
+            'laravel/framework'        => 'laravel',
+            'laravel/lumen-framework'  => 'lumen',
+            'symfony/framework-bundle' => 'symfony',
+            'symfony/symfony'          => 'symfony',
+            'slim/slim'                => 'slim',
+            'codeigniter4/framework'   => 'codeigniter',
+        ];
+
+        foreach ($frameworkPackages as $package => $framework) {
+            if (in_array($package, $depNamesLower)) {
+                return $framework;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Recursively yields every .php file under $dir, skipping vendor/,
+     * .git/, and other directories that never contain route definitions.
+     */
+    private static function walkPhpFiles(string $dir): \Generator
+    {
+        if (!is_dir($dir)) return;
+
+        $iterator = new \RecursiveIteratorIterator(
+            new \RecursiveDirectoryIterator($dir, \FilesystemIterator::SKIP_DOTS)
+        );
+
+        foreach ($iterator as $file) {
+            if ($file->getExtension() !== 'php') continue;
+
+            $path = $file->getPathname();
+            $skip = false;
+            foreach (self::STATIC_SKIP_DIRS as $skipDir) {
+                if (str_contains($path, DIRECTORY_SEPARATOR . $skipDir . DIRECTORY_SEPARATOR)) {
+                    $skip = true;
+                    break;
+                }
+            }
+            if ($skip) continue;
+
+            yield $path;
+        }
+    }
+
+    /**
+     * Laravel — parses every .php file under routes/ for:
+     *   Route::get('/path', ...)   Route::post('/path', ...)   etc.
+     *   Route::resource('name', Controller::class)
+     *   Route::apiResource('name', Controller::class)
+     * Request bodies aren't inferred in the static scan (that requires
+     * reflecting on the controller class, which needs the app booted) —
+     * the live scanLaravelRoutes() still covers that when reachable.
+     */
+    private static function scanLaravelRoutesStatic(string $cwd): array
+    {
+        $endpoints = [];
+        $seen = [];
+
+        $routesDir = $cwd . '/routes';
+        if (!is_dir($routesDir)) return $endpoints;
+
+        $methodPattern   = '/Route::(get|post|put|patch|delete|any)\s*\(\s*[\'"]([^\'"]+)[\'"]/i';
+        $resourcePattern = '/Route::(resource|apiResource)\s*\(\s*[\'"]([^\'"]+)[\'"]/i';
+
+        foreach (self::walkPhpFiles($routesDir) as $filepath) {
+            $content = @file_get_contents($filepath);
+            if ($content === false) continue;
+
+            if (preg_match_all($methodPattern, $content, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $method = strtoupper($m[1]);
+                    if ($method === 'ANY') $method = 'GET';
+                    $path = '/' . ltrim($m[2], '/');
+                    $normalized = self::normalizeLaravelPath($path);
+
+                    $key = $method . ':' . $normalized;
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $endpoints[] = [
+                        'method'      => $method,
+                        'path'        => $normalized,
+                        'description' => self::generateDescription($method, $normalized, null),
+                        'requestBody' => null,
+                        'detectedBy'  => 'static-scan-file',
+                    ];
+                }
+            }
+
+            if (preg_match_all($resourcePattern, $content, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $isApi = strtolower($m[1]) === 'apiresource';
+                    $base  = '/' . trim($m[2], '/');
+
+                    $resourceRoutes = $isApi
+                        ? [
+                            ['GET',    $base],
+                            ['POST',   $base],
+                            ['GET',    $base . '/:id'],
+                            ['PUT',    $base . '/:id'],
+                            ['DELETE', $base . '/:id'],
+                        ]
+                        : [
+                            ['GET',    $base],
+                            ['GET',    $base . '/create'],
+                            ['POST',   $base],
+                            ['GET',    $base . '/:id'],
+                            ['GET',    $base . '/:id/edit'],
+                            ['PUT',    $base . '/:id'],
+                            ['DELETE', $base . '/:id'],
+                        ];
+
+                    foreach ($resourceRoutes as [$method, $path]) {
+                        $key = $method . ':' . $path;
+                        if (isset($seen[$key])) continue;
+                        $seen[$key] = true;
+
+                        $endpoints[] = [
+                            'method'      => $method,
+                            'path'        => $path,
+                            'description' => self::generateDescription($method, $path, null),
+                            'requestBody' => null,
+                            'detectedBy'  => 'static-scan-file',
+                        ];
+                    }
+                }
+            }
+        }
+
+        return $endpoints;
+    }
+
+    /**
+     * Lumen — parses every .php file under routes/ for:
+     *   $router->get('/path', ...)   $router->post('/path', ...)   etc.
+     */
+    private static function scanLumenRoutesStatic(string $cwd): array
+    {
+        $endpoints = [];
+        $seen = [];
+
+        $routesDir = $cwd . '/routes';
+        if (!is_dir($routesDir)) return $endpoints;
+
+        $pattern = '/\$router->(get|post|put|patch|delete)\s*\(\s*[\'"]([^\'"]+)[\'"]/i';
+
+        foreach (self::walkPhpFiles($routesDir) as $filepath) {
+            $content = @file_get_contents($filepath);
+            if ($content === false) continue;
+
+            if (preg_match_all($pattern, $content, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $method = strtoupper($m[1]);
+                    $path   = '/' . ltrim($m[2], '/');
+                    $normalized = preg_replace('/\{([^}?]+)\??}/', ':$1', $path);
+
+                    $key = $method . ':' . $normalized;
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $endpoints[] = [
+                        'method'      => $method,
+                        'path'        => $normalized,
+                        'description' => self::generateDescription($method, $normalized, null),
+                        'requestBody' => null,
+                        'detectedBy'  => 'static-scan-file',
+                    ];
+                }
+            }
+        }
+
+        return $endpoints;
+    }
+
+    /**
+     * Symfony — parses controller files under src/ for both route styles:
+     *   #[Route('/path', methods: ['GET', 'POST'])]        (PHP 8 attributes)
+     *   * @Route("/path", methods={"GET","POST"})           (old annotations)
+     * Also checks config/routes.yaml for any additionally-declared paths.
+     */
+    private static function scanSymfonyRoutesStatic(string $cwd): array
+    {
+        $endpoints = [];
+        $seen = [];
+
+        $searchDirs = [$cwd . '/src'];
+
+        $attrPattern       = '/#\[Route\s*\(\s*[\'"]([^\'"]+)[\'"](.*?)\)\]/s';
+        $annotationPattern = '/@Route\s*\(\s*[\'"]([^\'"]+)[\'"](.*?)\)/s';
+
+        foreach ($searchDirs as $dir) {
+            if (!is_dir($dir)) continue;
+
+            foreach (self::walkPhpFiles($dir) as $filepath) {
+                $content = @file_get_contents($filepath);
+                if ($content === false) continue;
+
+                foreach ([$attrPattern, $annotationPattern] as $pattern) {
+                    if (preg_match_all($pattern, $content, $matches, PREG_SET_ORDER)) {
+                        foreach ($matches as $m) {
+                            $path = $m[1];
+                            $rest = $m[2];
+                            $normalized = preg_replace('/\{([^}]+)}/', ':$1', $path);
+                            if (!str_starts_with($normalized, '/')) $normalized = '/' . $normalized;
+
+                            $methods = ['GET'];
+                            if (preg_match('/methods\s*[:=]\s*\{?\[?([^}\]]+)\]?\}?/', $rest, $mm)) {
+                                $parsedMethods = array_map(function ($part) {
+                                    return strtoupper(trim($part, " \t\n\r\0\x0B'\""));
+                                }, explode(',', $mm[1]));
+                                $parsedMethods = array_filter($parsedMethods);
+                                if (!empty($parsedMethods)) $methods = $parsedMethods;
+                            }
+
+                            foreach ($methods as $method) {
+                                $key = $method . ':' . $normalized;
+                                if (isset($seen[$key])) continue;
+                                $seen[$key] = true;
+
+                                $endpoints[] = [
+                                    'method'      => $method,
+                                    'path'        => $normalized,
+                                    'description' => self::generateDescription($method, $normalized, null),
+                                    'requestBody' => null,
+                                    'detectedBy'  => 'static-scan-file',
+                                ];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also pick up plain YAML route declarations, e.g. config/routes.yaml
+        $yamlPath = $cwd . '/config/routes.yaml';
+        if (file_exists($yamlPath)) {
+            $content = @file_get_contents($yamlPath);
+            if ($content !== false && preg_match_all('/path:\s*[\'"]?([^\'"\n]+)[\'"]?/', $content, $pathMatches)) {
+                foreach ($pathMatches[1] as $rawPath) {
+                    $normalized = preg_replace('/\{([^}]+)}/', ':$1', trim($rawPath));
+                    if (!str_starts_with($normalized, '/')) continue;
+
+                    $key = 'GET:' . $normalized;
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $endpoints[] = [
+                        'method'      => 'GET',
+                        'path'        => $normalized,
+                        'description' => self::generateDescription('GET', $normalized, null),
+                        'requestBody' => null,
+                        'detectedBy'  => 'static-scan-file',
+                    ];
+                }
+            }
+        }
+
+        return $endpoints;
+    }
+
+    /**
+     * Slim 4 — parses every .php file in the project for:
+     *   $app->get('/path', ...)   $app->post('/path', ...)   etc.
+     * Only scans files that actually reference $app, to reduce false hits
+     * from unrelated code.
+     */
+    private static function scanSlimRoutesStatic(string $cwd): array
+    {
+        $endpoints = [];
+        $seen = [];
+
+        $pattern = '/\$app->(get|post|put|patch|delete)\s*\(\s*[\'"]([^\'"]+)[\'"]/i';
+
+        foreach (self::walkPhpFiles($cwd) as $filepath) {
+            $content = @file_get_contents($filepath);
+            if ($content === false) continue;
+            if (strpos($content, '$app') === false) continue;
+
+            if (preg_match_all($pattern, $content, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $m) {
+                    $method = strtoupper($m[1]);
+                    $path   = $m[2];
+                    $normalized = preg_replace('/\{([^}:]+):?[^}]*}/', ':$1', $path);
+                    if (!str_starts_with($normalized, '/')) $normalized = '/' . $normalized;
+
+                    $key = $method . ':' . $normalized;
+                    if (isset($seen[$key])) continue;
+                    $seen[$key] = true;
+
+                    $endpoints[] = [
+                        'method'      => $method,
+                        'path'        => $normalized,
+                        'description' => self::generateDescription($method, $normalized, null),
+                        'requestBody' => null,
+                        'detectedBy'  => 'static-scan-file',
+                    ];
+                }
+            }
+        }
+
+        return $endpoints;
+    }
+
+    /**
+     * CodeIgniter 4 — parses app/Config/Routes.php for:
+     *   $routes->get('/path', ...)   $routes->post('/path', ...)   etc.
+     */
+    private static function scanCodeIgniterRoutesStatic(string $cwd): array
+    {
+        $endpoints = [];
+        $seen = [];
+
+        $routesFile = $cwd . '/app/Config/Routes.php';
+        if (!file_exists($routesFile)) return $endpoints;
+
+        $content = @file_get_contents($routesFile);
+        if ($content === false) return $endpoints;
+
+        $pattern = '/\$routes->(get|post|put|patch|delete)\s*\(\s*[\'"]([^\'"]+)[\'"]/i';
+
+        if (preg_match_all($pattern, $content, $matches, PREG_SET_ORDER)) {
+            foreach ($matches as $m) {
+                $method = strtoupper($m[1]);
+                $path   = $m[2];
+
+                $normalized = preg_replace('/\(:num\)/',     ':id',    $path);
+                $normalized = preg_replace('/\(:segment\)/', ':param', $normalized);
+                $normalized = preg_replace('/\(:any\)/',     ':param', $normalized);
+                $normalized = '/' . ltrim($normalized, '/');
+
+                $key = $method . ':' . $normalized;
+                if (isset($seen[$key])) continue;
+                $seen[$key] = true;
+
+                $endpoints[] = [
+                    'method'      => $method,
+                    'path'        => $normalized,
+                    'description' => self::generateDescription($method, $normalized, null),
+                    'requestBody' => null,
+                    'detectedBy'  => 'static-scan-file',
+                ];
+            }
+        }
+
+        return $endpoints;
+    }
 }

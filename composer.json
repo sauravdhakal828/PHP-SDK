@@ -11,18 +11,35 @@
   ],
   "require": {
     "php": ">=8.0",
-    "laravel/framework": ">=9.0"
+    "ext-curl": "*",
+    "ext-json": "*"
   },
+  "suggest": {
+    "laravel/framework": "Required if using the SDK with Laravel (>=9.0)",
+    "laravel/lumen-framework": "Required if using the SDK with Lumen",
+    "symfony/framework-bundle": "Required if using the SDK with Symfony",
+    "slim/slim": "Required if using the SDK with Slim 4",
+    "codeigniter4/framework": "Required if using the SDK with CodeIgniter 4"
+  },
+  "bin": [
+    "bin/scan-endpoints.php"
+  ],
   "autoload": {
     "classmap": [
-      "BotVersion.php"
+      "BotVersion.php",
+      "Client.php",
+      "Scanner.php",
+      "Interceptor.php"
     ]
   },
   "keywords": [
     "botversion",
     "api",
     "sdk",
-    "laravel"
+    "laravel",
+    "symfony",
+    "slim",
+    "codeigniter"
   ],
   "homepage": "https://github.com/sauravdhakal828/PHP-SDK.git"
 }
