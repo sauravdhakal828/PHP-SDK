@@ -53,19 +53,11 @@ class BotVersionInterceptor
             $apiPrefix = $this->options['api_prefix'] ?? null;
 
             if (!$apiPrefix || str_starts_with($path, $apiPrefix)) {
-                $normalizedPath = $this->normalizePath($path);
-                $bodyStructure = $method !== 'GET'
-                    ? $this->buildBodyStructure($request->except(['_token', '_method']))
+                $rawBody = $method !== 'GET'
+                    ? $request->except(['_token', '_method'])
                     : null;
-                // tRPC GET: input is in URL query param, not body
-                if (!$bodyStructure) {
-                    $trpcBody = $this->extractTrpcGetInput($path, $request->getQueryString() ?? '');
-                    if ($trpcBody) {
-                        $bodyStructure = $this->buildBodyStructure($trpcBody);
-                    }
-                }
 
-                $this->maybeReport($method, $normalizedPath, $bodyStructure, $response->getStatusCode());
+                $this->reportEndpoint($method, $path, $rawBody, $request->getQueryString() ?? '', $response->getStatusCode());
             }
         }
 
@@ -149,31 +141,19 @@ class BotVersionInterceptor
             $apiPrefix = $this->options['api_prefix'] ?? null;
             if ($apiPrefix && !str_starts_with($path, $apiPrefix)) return;
 
-            $normalizedPath = $this->normalizePath($path);
-
-            // Symfony request body — try JSON first, then form data
-            $bodyStructure = null;
+            $rawBody = null;
             if ($method !== 'GET') {
                 $contentType = $request->headers->get('Content-Type', '');
 
                 if (str_contains($contentType, 'application/json')) {
                     $decoded = json_decode($request->getContent(), true);
-                    $body    = is_array($decoded) ? $decoded : [];
+                    $rawBody = is_array($decoded) ? $decoded : [];
                 } else {
-                    $body = $request->request->all();
-                }
-
-                $bodyStructure = $this->buildBodyStructure($body);
-            }
-            // tRPC GET: input is in URL query param, not body
-            if (!$bodyStructure) {
-                $trpcBody = $this->extractTrpcGetInput($path, $request->getQueryString() ?? '');
-                if ($trpcBody) {
-                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                    $rawBody = $request->request->all();
                 }
             }
 
-            $this->maybeReport($method, $normalizedPath, $bodyStructure, $response->getStatusCode());
+            $this->reportEndpoint($method, $path, $rawBody, $request->getQueryString() ?? '', $response->getStatusCode());
 
         } catch (\Exception $e) {
             // Silent — never break the app
@@ -218,33 +198,21 @@ class BotVersionInterceptor
             $apiPrefix = $this->options['api_prefix'] ?? null;
             if ($apiPrefix && !str_starts_with($path, $apiPrefix)) return $response;
 
-            $normalizedPath = $this->normalizePath($path);
-
-            // Slim PSR-7 request body
-            $bodyStructure = null;
+            $rawBody = null;
             if ($method !== 'GET') {
                 $contentType = $request->getHeaderLine('Content-Type');
 
                 if (str_contains($contentType, 'application/json')) {
                     $decoded = json_decode((string) $request->getBody(), true);
-                    $body    = is_array($decoded) ? $decoded : [];
+                    $rawBody = is_array($decoded) ? $decoded : [];
                 } else {
                     $parsed = $request->getParsedBody();
-                    $body   = is_array($parsed) ? $parsed : [];
-                }
-
-                $bodyStructure = $this->buildBodyStructure($body);
-            }
-            // tRPC GET: input is in URL query param, not body
-            if (!$bodyStructure) {
-                $queryString = $request->getUri()->getQuery();
-                $trpcBody = $this->extractTrpcGetInput($path, $queryString);
-                if ($trpcBody) {
-                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                    $rawBody = is_array($parsed) ? $parsed : [];
                 }
             }
 
-            $this->maybeReport($method, $normalizedPath, $bodyStructure, $response->getStatusCode());
+            $queryString = $request->getUri()->getQuery();
+            $this->reportEndpoint($method, $path, $rawBody, $queryString, $response->getStatusCode());
 
         } catch (\Exception $e) {
             // Silent
@@ -327,32 +295,20 @@ class BotVersionInterceptor
             $apiPrefix = $this->options['api_prefix'] ?? null;
             if ($apiPrefix && !str_starts_with($path, $apiPrefix)) return;
 
-            $normalizedPath = $this->normalizePath($path);
-
-            // CI4 request body
-            $bodyStructure = null;
+            $rawBody = null;
             if ($method !== 'GET') {
                 $contentType = $request->getHeaderLine('Content-Type');
 
                 if (str_contains($contentType, 'application/json')) {
                     $decoded = json_decode((string) $request->getBody(), true);
-                    $body    = is_array($decoded) ? $decoded : [];
+                    $rawBody = is_array($decoded) ? $decoded : [];
                 } else {
-                    $body = $request->getPost() ?? [];
-                }
-
-                $bodyStructure = $this->buildBodyStructure($body);
-            }
-            // tRPC GET: input is in URL query param, not body
-            if (!$bodyStructure) {
-                $trpcBody = $this->extractTrpcGetInput($path, $_SERVER['QUERY_STRING'] ?? '');
-                if ($trpcBody) {
-                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                    $rawBody = $request->getPost() ?? [];
                 }
             }
 
             $statusCode = $response->getStatusCode();
-            $this->maybeReport($method, $normalizedPath, $bodyStructure, $statusCode);
+            $this->reportEndpoint($method, $path, $rawBody, $_SERVER['QUERY_STRING'] ?? '', $statusCode);
 
         } catch (\Exception $e) {
             // Silent
@@ -413,26 +369,15 @@ class BotVersionInterceptor
             $apiPrefix = $this->options['api_prefix'] ?? null;
             if ($apiPrefix && !str_starts_with($path, $apiPrefix)) return;
 
-            $normalizedPath = $this->normalizePath($path);
-
-            $bodyStructure = null;
+            $rawBody = null;
             if ($method !== 'GET') {
                 $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
 
                 if (str_contains($contentType, 'application/json')) {
                     $decoded = json_decode(file_get_contents('php://input'), true);
-                    $body    = is_array($decoded) ? $decoded : [];
+                    $rawBody = is_array($decoded) ? $decoded : [];
                 } else {
-                    $body = $_POST ?? [];
-                }
-
-                $bodyStructure = $this->buildBodyStructure($body);
-            }
-            // tRPC GET: input is in URL query param, not body
-            if (!$bodyStructure) {
-                $trpcBody = $this->extractTrpcGetInput($path, $_SERVER['QUERY_STRING'] ?? '');
-                if ($trpcBody) {
-                    $bodyStructure = $this->buildBodyStructure($trpcBody);
+                    $rawBody = $_POST ?? [];
                 }
             }
 
@@ -440,17 +385,20 @@ class BotVersionInterceptor
             // of status since we can't check it. http_response_code() gives us the
             // code that was set via header() or http_response_code().
             $statusCode = http_response_code() ?: 200;
-            $this->maybeReport($method, $normalizedPath, $bodyStructure, $statusCode);
+            $this->reportEndpoint($method, $path, $rawBody, $_SERVER['QUERY_STRING'] ?? '', $statusCode);
 
         } catch (\Exception $e) {
             // Silent
         }
     }
 
-    private function extractTrpcGetInput(string $path, string $queryString): ?array
+    private function extractTrpcGetInputRaw(string $path, string $queryString): ?array
     {
         // tRPC GET requests send their input as a URL-encoded JSON query parameter
-        // called 'input'. Only activates for tRPC paths — safe for all REST endpoints.
+        // called 'input'. Returns the raw decoded array as-is — still batched if
+        // applicable — WITHOUT merging different procedures' fields together.
+        // Splitting per-procedure happens in reportEndpoint(). Only activates for
+        // tRPC paths — safe for all REST endpoints.
         if (strpos($path, '/trpc/') === false) return null;
         if (empty($queryString) || strpos($queryString, 'input=') === false) return null;
 
@@ -462,40 +410,99 @@ class BotVersionInterceptor
             $decoded = json_decode(urldecode($inputParam), true);
             if (!is_array($decoded)) return null;
 
-            $keys = array_keys($decoded);
-
-            // Format 1 — batched: { "0": { "json": {...} }, "1": { "json": {...} } }
-            $isBatch = count($keys) > 0 && count(array_filter($keys, 'is_numeric')) === count($keys);
-            if ($isBatch) {
-                $merged = [];
-                foreach ($keys as $k) {
-                    $entry = $decoded[$k];
-                    if (is_array($entry)) {
-                        // Unwrap { json: {...} } envelope if present
-                        $unwrapped = (isset($entry['json']) && is_array($entry['json']))
-                            ? $entry['json']
-                            : $entry;
-                        $merged = array_merge($merged, $unwrapped);
-                    }
-                }
-                return !empty($merged) ? $merged : null;
-            }
-
-            // Format 2 — single with superjson: { "json": {...}, "meta": {...} }
-            if (isset($decoded['json']) && is_array($decoded['json'])) {
-                return $decoded['json'];
-            }
-
-            // Format 3 — already unwrapped: { "group": {...}, "limit": 10 }
-            if (!isset($decoded['meta']) && !isset($decoded['json'])) {
-                return $decoded;
-            }
+            return $decoded;
 
         } catch (\Exception $e) {
-            // Silent
+            return null;
+        }
+    }
+
+    // Unwraps a single (non-batched) tRPC/superjson envelope:
+    // { "json": {...realFields...} } -> {...realFields...}
+    private function unwrapTrpcJsonEnvelope(array $obj): array
+    {
+        if (isset($obj['json']) && is_array($obj['json'])) {
+            return $obj['json'];
+        }
+        return $obj;
+    }
+
+    // tRPC batches multiple procedure calls into one URL, e.g.
+    //   /api/trpc/me.get,getUserTopBanners,bookingUnconfirmedCount
+    // tRPC is always mounted at a fixed base containing "/trpc/". Everything
+    // after that marker is the comma-separated procedure list, and each
+    // comma-separated piece is ALREADY a complete procedure path on its own
+    // (it may itself contain "/" for nested routers) — it must never have
+    // another procedure's prefix re-attached to it.
+    // Returns a single-item array unchanged if the path isn't a batch.
+    private function splitBatchPath(string $rawPath): array
+    {
+        $marker = '/trpc/';
+        $idx = strpos($rawPath, $marker);
+        if ($idx === false) return [$rawPath];
+
+        $base = substr($rawPath, 0, $idx + strlen($marker));
+        $tail = substr($rawPath, $idx + strlen($marker));
+
+        if (strpos($tail, ',') === false) return [$rawPath];
+
+        $procs = array_filter(array_map('trim', explode(',', $tail)), fn($p) => $p !== '');
+        return array_map(fn($p) => $base . $p, array_values($procs));
+    }
+
+    // Splits a batched tRPC request body/input — { "0": {...}, "1": {...} } —
+    // into a list of individual bodies, in the same order as the batch keys,
+    // which lines up with the order splitBatchPath() returns procedure names
+    // in. Each slot is unwrapped from its own { "json": {...} } envelope.
+    // Returns a single-item array unchanged if the body isn't actually batched.
+    private function splitBatchBody(array $bodyObj): array
+    {
+        $keys = array_keys($bodyObj);
+        $isBatch = count($keys) > 0 && count(array_filter($keys, 'is_numeric')) === count($keys);
+
+        if (!$isBatch) return [$bodyObj];
+
+        $orderedKeys = $keys;
+        sort($orderedKeys, SORT_NUMERIC);
+
+        $slots = [];
+        foreach ($orderedKeys as $k) {
+            $entry = $bodyObj[$k];
+            $slots[] = is_array($entry) ? $this->unwrapTrpcJsonEnvelope($entry) : $entry;
+        }
+        return $slots;
+    }
+
+    // Splits a (possibly batched) tRPC path into one clean endpoint per real
+    // procedure — instead of one garbled, comma-joined path — with each
+    // procedure's own body fields only, never mixed with another procedure's.
+    // Falls back to reporting a single endpoint unchanged when the path
+    // isn't a batch. This replaces calling maybeReport() directly.
+    private function reportEndpoint(string $method, string $path, ?array $bodyData, string $queryString, int $statusCode): void
+    {
+        $splitPaths = array_map(fn($p) => $this->normalizePath($p), $this->splitBatchPath($path));
+
+        $bodySlots = null;
+
+        // tRPC GET requests carry their input in the query string, not the body
+        if (empty($bodyData) && $queryString !== '') {
+            $rawInput = $this->extractTrpcGetInputRaw($path, $queryString);
+            if ($rawInput !== null) {
+                $bodySlots = $this->splitBatchBody($rawInput);
+            }
         }
 
-        return null;
+        if ($bodySlots === null) {
+            $bodySlots = count($splitPaths) > 1
+                ? $this->splitBatchBody($bodyData ?? [])
+                : [$bodyData];
+        }
+
+        foreach ($splitPaths as $i => $singlePath) {
+            $slotBody = $bodySlots[$i] ?? null;
+            $bodyStructure = !empty($slotBody) ? $this->buildBodyStructure($slotBody) : null;
+            $this->maybeReport($method, $singlePath, $bodyStructure, $statusCode);
+        }
     }
 
     // =========================================================================
