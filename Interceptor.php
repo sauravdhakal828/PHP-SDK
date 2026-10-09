@@ -7,6 +7,15 @@ class BotVersionInterceptor
     private $options;
     private static $reported = [];
 
+    // Reply-shape capture: in-process cache of per-endpoint state (also saved to temp files)
+    private static $responseState = [];
+
+    private const MAX_RESPONSE_ATTEMPTS      = 5;
+    private const MAX_RESPONSE_CAPTURE_BYTES = 262144; // 256 KB, bigger replies are skipped
+    private const MAX_RESPONSE_DEPTH         = 4;
+    private const MAX_RESPONSE_FIELDS        = 50;
+    private const RESPONSE_STATE_TTL         = 86400;  // re-send a shape after 24h
+
     private const IGNORE_PATHS = [
         '/health',
         '/favicon.ico',
@@ -18,6 +27,7 @@ class BotVersionInterceptor
         '/sanctum',
         '/_debugbar',
         '/profiler',
+        '/__botversion',
     ];
 
     public function __construct($client, array $options = [])
@@ -47,6 +57,13 @@ class BotVersionInterceptor
             ], fn($v) => $v !== null), $result['status']);
         }
 
+        // Drops cache-validation headers so the app sends a full reply instead of an empty 304
+        // (which has no body to read). Only runs while this endpoint still has no captured shape.
+        if ($this->isResponseShapeNeeded($method, $path)) {
+            $request->headers->remove('If-None-Match');
+            $request->headers->remove('If-Modified-Since');
+        }
+
         $response = $next($request);
 
         if (!$this->shouldIgnore($path)) {
@@ -57,7 +74,11 @@ class BotVersionInterceptor
                     ? $request->except(['_token', '_method'])
                     : null;
 
-                $this->reportEndpoint($method, $path, $rawBody, $request->getQueryString() ?? '', $response->getStatusCode());
+                $this->reportEndpoint(
+                    $method, $path, $rawBody, $request->getQueryString() ?? '', $response->getStatusCode(),
+                    $response->headers->get('Content-Type', ''),
+                    $this->readHttpFoundationBody($response)
+                );
             }
         }
 
@@ -88,6 +109,13 @@ class BotVersionInterceptor
             $request = $event->getRequest();
             $path    = $request->getPathInfo();
             $method  = strtoupper($request->getMethod());
+
+            // Drops cache-validation headers so the app sends a full reply instead of an empty 304
+            // (which has no body to read). Only runs while this endpoint still has no captured shape.
+            if ($this->isResponseShapeNeeded($method, $path)) {
+                $request->headers->remove('If-None-Match');
+                $request->headers->remove('If-Modified-Since');
+            }
 
             if ($path !== '/__botversion/scan' || $method !== 'POST') return;
 
@@ -153,7 +181,11 @@ class BotVersionInterceptor
                 }
             }
 
-            $this->reportEndpoint($method, $path, $rawBody, $request->getQueryString() ?? '', $response->getStatusCode());
+            $this->reportEndpoint(
+                $method, $path, $rawBody, $request->getQueryString() ?? '', $response->getStatusCode(),
+                $response->headers->get('Content-Type', ''),
+                $this->readHttpFoundationBody($response)
+            );
 
         } catch (\Exception $e) {
             // Silent — never break the app
@@ -189,6 +221,12 @@ class BotVersionInterceptor
             return $response->withHeader('Content-Type', 'application/json');
         }
 
+        // Drops cache-validation headers so the app sends a full reply instead of an empty 304
+        // (which has no body to read). Only runs while this endpoint still has no captured shape.
+        if ($this->isResponseShapeNeeded($method, $path)) {
+            $request = $request->withoutHeader('If-None-Match')->withoutHeader('If-Modified-Since');
+        }
+
         // Let the app handle the request first
         $response = $handler->handle($request);
 
@@ -212,7 +250,11 @@ class BotVersionInterceptor
             }
 
             $queryString = $request->getUri()->getQuery();
-            $this->reportEndpoint($method, $path, $rawBody, $queryString, $response->getStatusCode());
+            $this->reportEndpoint(
+                $method, $path, $rawBody, $queryString, $response->getStatusCode(),
+                $response->getHeaderLine('Content-Type'),
+                $this->readPsr7Body($response)
+            );
 
         } catch (\Exception $e) {
             // Silent
@@ -308,7 +350,12 @@ class BotVersionInterceptor
             }
 
             $statusCode = $response->getStatusCode();
-            $this->reportEndpoint($method, $path, $rawBody, $_SERVER['QUERY_STRING'] ?? '', $statusCode);
+            $ciBody     = $response->getBody();
+            $this->reportEndpoint(
+                $method, $path, $rawBody, $_SERVER['QUERY_STRING'] ?? '', $statusCode,
+                $response->getHeaderLine('Content-Type'),
+                is_string($ciBody) ? $ciBody : null
+            );
 
         } catch (\Exception $e) {
             // Silent
@@ -478,7 +525,7 @@ class BotVersionInterceptor
     // procedure's own body fields only, never mixed with another procedure's.
     // Falls back to reporting a single endpoint unchanged when the path
     // isn't a batch. This replaces calling maybeReport() directly.
-    private function reportEndpoint(string $method, string $path, ?array $bodyData, string $queryString, int $statusCode): void
+    private function reportEndpoint(string $method, string $path, ?array $bodyData, string $queryString, int $statusCode, ?string $responseContentType = null, $responseBody = null): void
     {
         $splitPaths = array_map(fn($p) => $this->normalizePath($p), $this->splitBatchPath($path));
 
@@ -503,6 +550,10 @@ class BotVersionInterceptor
             $bodyStructure = !empty($slotBody) ? $this->buildBodyStructure($slotBody) : null;
             $this->maybeReport($method, $singlePath, $bodyStructure, $statusCode);
         }
+
+        // Capture the shape of the successful JSON reply (field names only).
+        // Runs after the request report so the endpoint is always registered first.
+        $this->maybeReportResponse($method, $path, $statusCode, $responseContentType, $responseBody);
     }
 
     // =========================================================================
@@ -528,6 +579,27 @@ class BotVersionInterceptor
         }
 
         return ['success' => false, 'error' => 'Unauthorized', 'status' => 401];
+    }
+
+    // True while at least one endpoint behind this path still has no captured reply shape
+    private function isResponseShapeNeeded(string $method, string $path): bool
+    {
+        try {
+            if ($this->shouldIgnore($path)) return false;
+
+            $apiPrefix = $this->options['api_prefix'] ?? null;
+            if ($apiPrefix && !str_starts_with($path, $apiPrefix)) return false;
+
+            if (strpos($path, '/__botversion/') === 0) return false;
+
+            foreach ($this->splitBatchPath($path) as $rawPath) {
+                $state = $this->getResponseState($method, $this->normalizePath($rawPath));
+                if (!$state['done'] && $state['attempts'] < self::MAX_RESPONSE_ATTEMPTS) return true;
+            }
+        } catch (\Throwable $e) {
+            // Silent, never break the app
+        }
+        return false;
     }
 
     // Deduplicates reports — same method + path + body shape is only reported once
@@ -687,6 +759,282 @@ class BotVersionInterceptor
             ]);
         } catch (\Exception $e) {
             // Silent — never break the app
+        }
+    }
+
+        // =========================================================================
+    // ── RESPONSE SHAPE CAPTURE ────────────────────────────────────────────────
+    // =========================================================================
+    // Records only field names and types of successful JSON replies (never
+    // values) so the platform knows what each endpoint returns.
+
+    // The ONE method every framework reaches once it has the app's reply.
+    // $body may be a string or null (null = reply could not be read safely,
+    // e.g. a stream or file download: skipped, but counted as an attempt).
+    private function maybeReportResponse(string $method, string $path, int $statusCode, ?string $contentType, $body): void
+    {
+        try {
+            if ($statusCode < 200 || $statusCode >= 300) return;
+
+            // Our own scan-trigger route must never be reported as one of the host's endpoints
+            if (strpos($path, '/__botversion/') === 0) return;
+
+            $paths = array_map(fn($p) => $this->normalizePath($p), $this->splitBatchPath($path));
+
+            // Which of these endpoints still need a reply shape?
+            $pending = [];
+            foreach ($paths as $p) {
+                $state = $this->getResponseState($method, $p);
+                if (!$state['done'] && $state['attempts'] < self::MAX_RESPONSE_ATTEMPTS) {
+                    $pending[] = $p;
+                }
+            }
+            if (empty($pending)) return;
+
+            // Count this reply as an attempt so endpoints with no usable shape are eventually dropped
+            foreach ($pending as $p) {
+                $state = $this->getResponseState($method, $p);
+                $state['attempts']++;
+                $this->saveResponseState($method, $p, $state);
+            }
+
+            if (!is_string($body) || $body === '' || strlen($body) > self::MAX_RESPONSE_CAPTURE_BYTES) return;
+
+            $ct = strtolower((string) $contentType);
+            if ($ct !== '' && strpos($ct, 'json') === false) return;
+
+            $parsed = json_decode($body);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                // The host app may have compressed the reply (gzip / deflate / brotli)
+                $raw = null;
+                if (substr($body, 0, 2) === "\x1f\x8b" && function_exists('gzdecode')) {
+                    $raw = @gzdecode($body, 1048576);
+                } elseif (substr($body, 0, 1) === "\x78" && function_exists('gzuncompress')) {
+                    $raw = @gzuncompress($body, 1048576);
+                } elseif (function_exists('brotli_uncompress')) {
+                    $raw = @brotli_uncompress($body, 1048576);
+                }
+                if (!is_string($raw) || $raw === '') return;
+                $parsed = json_decode($raw);
+                if (json_last_error() !== JSON_ERROR_NONE) return;
+            }
+
+            $this->reportResponseShape($method, $path, $parsed);
+        } catch (\Throwable $e) {
+            // Silent, never break the app
+        }
+    }
+
+    // Turns an already-parsed reply into field-name shapes and reports each new one
+    private function reportResponseShape(string $method, string $rawPath, $parsed): void
+    {
+        if (!is_object($parsed) && !is_array($parsed)) return;
+
+        $isTrpc = strpos($rawPath, '/trpc/') !== false;
+        $paths  = array_map(fn($p) => $this->normalizePath($p), $this->splitBatchPath($rawPath));
+
+        if (count($paths) > 1) {
+            if (!$isTrpc || !is_array($parsed) || count($parsed) !== count($paths)) return;
+            $slots = array_map(fn($e) => $this->unwrapTrpcResult($e), array_values($parsed));
+        } else {
+            $slots = [$isTrpc ? $this->unwrapTrpcResult($parsed) : $parsed];
+        }
+
+        foreach ($paths as $i => $p) {
+            $slot = $slots[$i] ?? null;
+            if (!is_object($slot) && !is_array($slot)) continue;
+
+            $state = $this->getResponseState($method, $p);
+            if ($state['done']) continue;
+
+            $schema = $this->describeResponseValue($slot, 0);
+            if (!$this->hasResponseFields($schema)) continue;
+
+            $state['done'] = true;
+            $this->saveResponseState($method, $p, $state);
+
+            $this->client->updateEndpoint([
+                'method'       => $method,
+                'path'         => $p,
+                'requestBody'  => null,
+                'responseBody' => $schema,
+                'detectedBy'   => 'runtime',
+            ]);
+        }
+    }
+
+    // JSON is decoded as objects (not arrays) so an empty {} and an empty [] stay distinguishable
+    private function describeResponseValue($val, int $depth = 0): array
+    {
+        if ($val === null) return ['type' => 'string'];
+
+        if (is_array($val)) {
+            if ($depth >= self::MAX_RESPONSE_DEPTH || count($val) === 0) {
+                return ['type' => 'array', 'items' => ['type' => 'object']];
+            }
+            return [
+                'type'  => 'array',
+                'items' => $this->describeArrayItems(array_slice($val, 0, 5), $depth + 1),
+            ];
+        }
+
+        if (is_object($val)) {
+            $vars = get_object_vars($val);
+            if ($depth >= self::MAX_RESPONSE_DEPTH) return ['type' => 'object'];
+            foreach (array_keys($vars) as $k) {
+                if ($this->looksLikeIdKey($k)) return ['type' => 'object'];
+            }
+            $properties = [];
+            foreach (array_slice($vars, 0, self::MAX_RESPONSE_FIELDS, true) as $k => $v) {
+                $properties[(string) $k] = $this->describeResponseValue($v, $depth + 1);
+            }
+            return $properties ? ['type' => 'object', 'properties' => $properties] : ['type' => 'object'];
+        }
+
+        if (is_bool($val)) return ['type' => 'boolean'];
+        if (is_int($val) || is_float($val)) return ['type' => 'number'];
+        return ['type' => 'string'];
+    }
+
+    // Combines the first few list items so fields missing from one item still appear
+    private function describeArrayItems(array $items, int $depth): array
+    {
+        $objs = array_values(array_filter($items, 'is_object'));
+        if (empty($objs)) {
+            foreach ($items as $item) {
+                if ($item !== null) return $this->describeResponseValue($item, $depth);
+            }
+            return ['type' => 'object'];
+        }
+
+        $merged = [];
+        foreach ($objs as $o) {
+            foreach (array_slice(get_object_vars($o), 0, self::MAX_RESPONSE_FIELDS, true) as $k => $v) {
+                if (!isset($merged[$k])) $merged[$k] = $v;
+            }
+        }
+        return $this->describeResponseValue((object) $merged, $depth);
+    }
+
+    // A shape with no fields (empty list, {}) is not useful, so keep waiting for a better reply
+    private function hasResponseFields($schema): bool
+    {
+        if (!is_array($schema)) return false;
+        if (($schema['type'] ?? '') === 'array') {
+            return $this->hasResponseFields($schema['items'] ?? null);
+        }
+        return !empty($schema['properties']);
+    }
+
+    // Keys that look like record IDs or emails are never sent as field names
+    private function looksLikeIdKey($key): bool
+    {
+        $key = (string) $key;
+        return (bool) (
+            preg_match('/^\d+$/', $key)
+            || preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $key)
+            || preg_match('/^[0-9a-f]{24}$/i', $key)
+            || preg_match('/^c[a-z0-9]{20,}$/i', $key)
+            || (strlen($key) >= 16 && preg_match('/[a-zA-Z]/', $key) && preg_match('/[0-9]/', $key))
+            || strpos($key, '@') !== false
+        );
+    }
+
+    // tRPC wraps each result as { result: { data: { json: ... } } }; errors as { error }
+    private function unwrapTrpcResult($entry)
+    {
+        if (is_object($entry)) {
+            if (!empty($entry->error) && empty($entry->result)) return null;
+            if (isset($entry->result) && is_object($entry->result) && property_exists($entry->result, 'data')) {
+                $data = $entry->result->data;
+                return (is_object($data) && property_exists($data, 'json')) ? $data->json : $data;
+            }
+        }
+        return $entry;
+    }
+
+    // ── Per-endpoint memory (survives between PHP requests) ──────────────────
+
+    private function responseStateFile(string $method, string $path): string
+    {
+        $secret = (string) ($this->options['scan_secret'] ?? '');
+        return sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'botversion_resp_' . md5($secret . '|' . $method . ':' . $path);
+    }
+
+    private function getResponseState(string $method, string $path): array
+    {
+        $key = $method . ':' . $path;
+        if (isset(self::$responseState[$key])) return self::$responseState[$key];
+
+        $state = ['done' => false, 'attempts' => 0];
+        try {
+            $file = $this->responseStateFile($method, $path);
+            if (is_file($file) && (time() - (int) @filemtime($file)) < self::RESPONSE_STATE_TTL) {
+                $raw = trim((string) @file_get_contents($file));
+                if ($raw === 'done') {
+                    $state['done'] = true;
+                } else {
+                    $state['attempts'] = (int) $raw;
+                }
+            }
+        } catch (\Throwable $e) {
+            // Silent, falls back to in-memory state only
+        }
+
+        return self::$responseState[$key] = $state;
+    }
+
+    private function saveResponseState(string $method, string $path, array $state): void
+    {
+        self::$responseState[$method . ':' . $path] = $state;
+        try {
+            @file_put_contents(
+                $this->responseStateFile($method, $path),
+                $state['done'] ? 'done' : (string) $state['attempts'],
+                LOCK_EX
+            );
+        } catch (\Throwable $e) {
+            // Silent
+        }
+    }
+
+    // ── Readers: get the reply body out of each kind of response object ──────
+
+    // Laravel, Lumen and Symfony replies. Streams and file downloads are skipped on purpose.
+    private function readHttpFoundationBody($response): ?string
+    {
+        try {
+            if (!is_object($response) || !method_exists($response, 'getContent')) return null;
+            if (
+                $response instanceof \Symfony\Component\HttpFoundation\StreamedResponse ||
+                $response instanceof \Symfony\Component\HttpFoundation\BinaryFileResponse
+            ) {
+                return null;
+            }
+            $content = $response->getContent();
+            return is_string($content) ? $content : null;
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    // Slim (PSR-7) replies. The stream position is put back so the app's reply is unchanged.
+    private function readPsr7Body($response): ?string
+    {
+        try {
+            if (!is_object($response) || !method_exists($response, 'getBody')) return null;
+            $stream = $response->getBody();
+            $size   = $stream->getSize();
+            if ($size === null || $size > self::MAX_RESPONSE_CAPTURE_BYTES || !$stream->isSeekable()) return null;
+
+            $position = $stream->tell();
+            $stream->rewind();
+            $content = $stream->getContents();
+            $stream->seek($position);
+
+            return is_string($content) ? $content : null;
+        } catch (\Throwable $e) {
+            return null;
         }
     }
 }

@@ -52,6 +52,7 @@ class BotVersionScanner
                         'path'        => $normalizedPath,
                         'description' => self::generateDescription($method, $normalizedPath, $handlerName),
                         'requestBody' => $requestBody,
+                        'responseBody' => self::staticResponseForMethods(self::getHandlerSource($route->getAction('uses')), $methods),
                         'detectedBy'  => 'static-scan',
                     ];
                 }
@@ -89,6 +90,7 @@ class BotVersionScanner
                     'path'        => $normalizedPath,
                     'description' => self::generateDescription($method, $normalizedPath, null),
                     'requestBody' => null,
+                    'responseBody' => self::extractStaticResponse(self::getHandlerSource($route['action']['uses'] ?? ($route['action'][0] ?? null))),
                     'detectedBy'  => 'static-scan',
                 ];
             }
@@ -150,6 +152,7 @@ class BotVersionScanner
                         'path'        => $normalizedPath,
                         'description' => self::generateDescription($method, $normalizedPath, $name),
                         'requestBody' => null,
+                        'responseBody' => self::staticResponseForMethods(self::getHandlerSource($route->getDefault('_controller')), $methods),
                         'detectedBy'  => 'static-scan',
                     ];
                 }
@@ -192,6 +195,7 @@ class BotVersionScanner
                         'path'        => $normalizedPath,
                         'description' => self::generateDescription($method, $normalizedPath, null),
                         'requestBody' => null,
+                        'responseBody' => self::staticResponseForMethods(self::getHandlerSource(method_exists($route, 'getCallable') ? $route->getCallable() : null), $methods),
                         'detectedBy'  => 'static-scan',
                     ];
                 }
@@ -243,6 +247,7 @@ class BotVersionScanner
                     'path'        => $normalizedPath,
                     'description' => self::generateDescription($method, $normalizedPath, $handlerName),
                     'requestBody' => null,
+                    'responseBody' => self::extractStaticResponse(self::getHandlerSource($handler)),
                     'detectedBy'  => 'static-scan',
                 ];
             }
@@ -1070,6 +1075,7 @@ class BotVersionScanner
                                     'path'        => $normalized,
                                     'description' => self::generateDescription($method, $normalized, null),
                                     'requestBody' => null,
+                                    'responseBody' => self::staticResponseAfter($content, $m[0], $pattern, $methods),
                                     'detectedBy'  => 'static-scan-file',
                                 ];
                             }
@@ -1136,11 +1142,12 @@ class BotVersionScanner
                     $seen[$key] = true;
 
                     $endpoints[] = [
-                        'method'      => $method,
-                        'path'        => $normalized,
-                        'description' => self::generateDescription($method, $normalized, null),
-                        'requestBody' => null,
-                        'detectedBy'  => 'static-scan-file',
+                        'method'       => $method,
+                        'path'         => $normalized,
+                        'description'  => self::generateDescription($method, $normalized, null),
+                        'requestBody'  => null,
+                        'responseBody' => self::staticResponseAfter($content, $m[0], $pattern),
+                        'detectedBy'   => 'static-scan-file',
                     ];
                 }
             }
@@ -1191,5 +1198,311 @@ class BotVersionScanner
         }
 
         return $endpoints;
+    }
+
+        // =========================================================================
+    // ── STATIC RESPONSE-SHAPE GUESSING ────────────────────────────────────────
+    // =========================================================================
+    // Best-effort: reads field names from reply arrays written out directly in
+    // the code (e.g. response()->json(['id' => $id, 'name' => 'x'])). Replies
+    // built from variables are left empty on purpose; real runtime replies
+    // fill those in later and replace any guess made here.
+
+    private const STATIC_MAX_RESPONSE_FIELDS = 50;
+    private const STATIC_MAX_LITERAL_LENGTH  = 6000;
+
+    // True when the handler's code looks at the HTTP method itself (so it may reply differently per method)
+    private static function handlerChecksMethod(?string $src): bool
+    {
+        if (!is_string($src) || $src === '') return false;
+        return (bool) preg_match(
+            '~->\s*(?:isMethod|getMethod|method|isPost|isGet|isPut|isPatch|isDelete)\s*\(|->\s*is\s*\(\s*[\'"](?:get|post|put|patch|delete)|\bREQUEST_METHOD\b~i',
+            $src
+        );
+    }
+
+    // For routes registered under several HTTP methods: no guess when the handler checks the method itself
+    private static function staticResponseForMethods(?string $src, array $methods = []): ?array
+    {
+        $served = array_diff(array_map('strtoupper', array_map('strval', $methods)), ['HEAD', 'OPTIONS']);
+        if (count($served) > 1 && self::handlerChecksMethod($src)) return null;
+        return self::extractStaticResponse($src);
+    }
+
+    // Finds the first successful reply written as an array inside a piece of code
+    public static function extractStaticResponse(?string $src): ?array
+    {
+        try {
+            if (!is_string($src) || $src === '') return null;
+
+            $patterns = [
+                // response()->json([...])  $this->json([...])  new JsonResponse([...])  ->setJSON([...])  ->respond([...])
+                '~(?:->|::)\s*(?:json|setJSON|respond|respondCreated|withJson)\s*\(\s*\[|\bnew\s+[\w\\\\]*JsonResponse\s*\(\s*\[~i',
+                // json_encode([...]) written straight to the reply
+                '~(?:->\s*write\s*\(|\becho\b)\s*json_encode\s*\(\s*\[~i',
+                // return [...]  (Laravel / Lumen turn a returned array into JSON)
+                '~\breturn\s*\[~',
+            ];
+
+            $candidates = [];
+            foreach ($patterns as $pattern) {
+                if (!preg_match_all($pattern, $src, $found, PREG_OFFSET_CAPTURE)) continue;
+                foreach ($found[0] as $hit) {
+                    // every pattern ends on the "[" that opens the reply array
+                    $candidates[] = ['offset' => $hit[1], 'open' => $hit[1] + strlen($hit[0]) - 1];
+                }
+            }
+            usort($candidates, fn($a, $b) => $a['offset'] <=> $b['offset']);
+
+            foreach ($candidates as $c) {
+                // A reply inside a nested callback is not the endpoint's own reply
+                if (self::isInsideNestedClosure($src, $c['offset'])) continue;
+
+                $close = self::findStaticClosing($src, $c['open'], ']');
+                if ($close === null) continue;
+
+                // Replies sent with an error status are not the normal shape
+                $from   = max(0, $c['offset'] - 100);
+                $before = substr($src, $from, $c['offset'] - $from);
+                $after  = substr($src, $close + 1, 120);
+                $status = 200;
+                if (preg_match('~(?:setStatusCode|withStatus|setStatus)\s*\(\s*([^)\s]+)\s*\)\s*$~', $before, $sm)) {
+                    $status = self::staticStatusFromToken($sm[1]);
+                }
+                if (preg_match('~^\s*,\s*([^,)\s;]+)~', $after, $sm)) {
+                    $status = self::staticStatusFromToken($sm[1]);
+                } elseif (preg_match('~^\s*\)\s*->\s*(?:setStatusCode|withStatus|setStatus|status)\s*\(\s*([^)\s]+)\s*\)~', $after, $sm)) {
+                    $status = self::staticStatusFromToken($sm[1]);
+                }
+                if ($status >= 400) continue;
+
+                $inner   = substr($src, $c['open'] + 1, $close - $c['open'] - 1);
+                $entries = self::splitStaticEntries($inner);
+                if ($entries === null) continue;
+
+                $properties = [];
+                foreach ($entries as $entry) {
+                    if (count($properties) >= self::STATIC_MAX_RESPONSE_FIELDS) break;
+                    // only 'key' => value entries; spreads and list items are skipped
+                    if (!preg_match('~^(?:\'([^\']+)\'|"([^"$]+)")\s*=>\s*(.+)$~s', $entry, $em)) continue;
+                    $key = $em[1] !== '' ? $em[1] : $em[2];
+                    $properties[$key] = self::guessStaticValueType($em[3]);
+                }
+
+                if (empty($properties)) continue;
+                if (array_keys($properties) === ['error']) continue; // looks like an error reply
+
+                // "_source" lets the server replace this guess with a real runtime reply later
+                return ['type' => 'object', 'properties' => $properties, '_source' => 'static'];
+            }
+        } catch (\Throwable $e) {
+            // Silent, a missing guess is fine
+        }
+        return null;
+    }
+
+    // Only literal values reveal their type; anything computed is marked "unknown"
+    private static function guessStaticValueType(string $value): array
+    {
+        $v = trim($value);
+        if (preg_match('~^(?:\'(?:[^\'\\\\]|\\\\.)*\'|"(?:[^"\\\\]|\\\\.)*")$~s', $v)) return ['type' => 'string'];
+        if (preg_match('~^-?\d+(\.\d+)?$~', $v)) return ['type' => 'number'];
+        if (preg_match('~^(true|false)$~i', $v)) return ['type' => 'boolean'];
+        if (preg_match('~^(\[|array\s*\()~i', $v)) {
+            return strpos($v, '=>') !== false
+                ? ['type' => 'object']
+                : ['type' => 'array', 'items' => ['type' => 'unknown']];
+        }
+        return ['type' => 'unknown'];
+    }
+
+    // 404 / Response::HTTP_NOT_FOUND etc. => error code. Anything unreadable counts as 200.
+    private static function staticStatusFromToken(string $token): int
+    {
+        $token = trim($token);
+        if (preg_match('~^\d{3}$~', $token)) return (int) $token;
+        if (preg_match('~HTTP_([A-Z_]+)$~', $token, $m)) {
+            return in_array($m[1], ['OK', 'CREATED', 'ACCEPTED', 'NON_AUTHORITATIVE_INFORMATION'], true) ? 200 : 500;
+        }
+        return 500;   // status given by a variable/expression: cannot be known to be a success, so no guess
+    }
+
+    // Returns the index of the quote that closes the string starting at $start (-1 if not found)
+    private static function skipStaticString(string $text, int $start, int $limit): int
+    {
+        $quote = $text[$start];
+        for ($i = $start + 1; $i < $limit; $i++) {
+            $ch = $text[$i];
+            if ($ch === '\\') { $i++; continue; }
+            if ($ch === $quote) return $i;
+        }
+        return -1;
+    }
+
+    // Returns the index of the bracket that closes the one at $openIndex (null if it cannot be matched safely)
+    private static function findStaticClosing(string $text, int $openIndex, string $closeChar): ?int
+    {
+        $depth = 0;
+        $limit = min(strlen($text), $openIndex + self::STATIC_MAX_LITERAL_LENGTH);
+        for ($i = $openIndex; $i < $limit; $i++) {
+            $ch   = $text[$i];
+            $next = $text[$i + 1] ?? '';
+
+            if (($ch === '/' && $next === '/') || $ch === '#') {
+                $nl = strpos($text, "\n", $i);
+                if ($nl === false) return null;
+                $i = $nl;
+                continue;
+            }
+            if ($ch === '/' && $next === '*') {
+                $end = strpos($text, '*/', $i + 2);
+                if ($end === false) return null;
+                $i = $end + 1;
+                continue;
+            }
+            if ($ch === '"' || $ch === "'") {
+                $i = self::skipStaticString($text, $i, $limit);
+                if ($i === -1) return null;
+                continue;
+            }
+            if ($ch === '[' || $ch === '(' || $ch === '{') {
+                $depth++;
+            } elseif ($ch === ']' || $ch === ')' || $ch === '}') {
+                $depth--;
+                if ($depth === 0) return $ch === $closeChar ? $i : null;
+                if ($depth < 0) return null;
+            }
+        }
+        return null;
+    }
+
+    // Splits the inside of an array literal on top-level commas (comments removed)
+    private static function splitStaticEntries(string $inner): ?array
+    {
+        $entries = [];
+        $current = '';
+        $depth   = 0;
+        $len     = strlen($inner);
+
+        for ($i = 0; $i < $len; $i++) {
+            $ch   = $inner[$i];
+            $next = $inner[$i + 1] ?? '';
+
+            if (($ch === '/' && $next === '/') || $ch === '#') {
+                $nl = strpos($inner, "\n", $i);
+                if ($nl === false) break;
+                $i = $nl;
+                continue;
+            }
+            if ($ch === '/' && $next === '*') {
+                $end = strpos($inner, '*/', $i + 2);
+                if ($end === false) break;
+                $i = $end + 1;
+                continue;
+            }
+            if ($ch === '"' || $ch === "'") {
+                $end = self::skipStaticString($inner, $i, $len);
+                if ($end === -1) return null;
+                $current .= substr($inner, $i, $end - $i + 1);
+                $i = $end;
+                continue;
+            }
+            if ($ch === '[' || $ch === '(' || $ch === '{') {
+                $depth++;
+            } elseif ($ch === ']' || $ch === ')' || $ch === '}') {
+                $depth--;
+            }
+            if ($ch === ',' && $depth === 0) {
+                $entries[] = trim($current);
+                $current = '';
+                continue;
+            }
+            $current .= $ch;
+        }
+        if (trim($current) !== '') $entries[] = trim($current);
+        return $entries;
+    }
+
+    // True when the position sits inside a callback (function () { ... }) nested in the handler.
+    // The first "function" in the code is the handler itself and is not counted.
+    private static function isInsideNestedClosure(string $src, int $pos): bool
+    {
+        if (!preg_match('~\bfunction\b~', $src, $first, PREG_OFFSET_CAPTURE)) return false;
+        $firstOffset = $first[0][1];
+        if (!preg_match_all('~\bfunction\s*&?\s*\(~', $src, $anon, PREG_OFFSET_CAPTURE)) return false;
+
+        foreach ($anon[0] as $hit) {
+            $offset = $hit[1];
+            if ($offset === $firstOffset || $offset >= $pos) continue;
+            $bracePos = strpos($src, '{', $offset);
+            if ($bracePos === false || $bracePos >= $pos) continue;
+            $close = self::findStaticClosing($src, $bracePos, '}');
+            if ($close === null || $pos < $close) return true; // cannot tell => skip, to be safe
+        }
+        return false;
+    }
+
+    // Finds the source code of a route handler: closure, "Class@method", "Class::method",
+    // "Class:method", [Class, 'method'] or an invokable class.
+    private static function getHandlerSource($handler): ?string
+    {
+        try {
+            if ($handler instanceof \Closure) {
+                $ref = new \ReflectionFunction($handler);
+            } else {
+                $class      = null;
+                $methodName = '__invoke';
+
+                if (is_array($handler) && count($handler) === 2) {
+                    $class      = is_object($handler[0]) ? get_class($handler[0]) : $handler[0];
+                    $methodName = $handler[1];
+                } elseif (is_object($handler)) {
+                    $class = get_class($handler);
+                } elseif (is_string($handler) && $handler !== '') {
+                    $handler = preg_replace('~/\$\d+.*$~', '', $handler); // CodeIgniter "Controller::method/$1"
+                    if (strpos($handler, '@') !== false) {
+                        [$class, $methodName] = explode('@', $handler, 2);
+                    } elseif (strpos($handler, '::') !== false) {
+                        [$class, $methodName] = explode('::', $handler, 2);
+                    } elseif (strpos($handler, ':') !== false) {
+                        [$class, $methodName] = explode(':', $handler, 2);
+                    } else {
+                        $class = $handler;
+                    }
+                }
+
+                if (!is_string($class) || $class === '') return null;
+                if (!class_exists($class)) {
+                    // CodeIgniter 4 lets routes name controllers without their namespace
+                    $guess = 'App\\Controllers\\' . ltrim($class, '\\');
+                    if (!class_exists($guess)) return null;
+                    $class = $guess;
+                }
+                $ref = new \ReflectionMethod($class, $methodName);
+            }
+
+            $file = $ref->getFileName();
+            if (!is_string($file) || $file === '') return null;
+            return self::extractSourceFromFile($file, (int) $ref->getStartLine(), (int) $ref->getEndLine());
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    // For file scans: takes the code from one route definition up to the next one
+    private static function staticResponseAfter(string $content, string $matchedText, string $boundaryRegex, array $methods = []): ?array
+    {
+        try {
+            $start = strpos($content, $matchedText);
+            if ($start === false) return null;
+            $from = $start + strlen($matchedText);
+            $end  = strlen($content);
+            if (preg_match($boundaryRegex, $content, $b, PREG_OFFSET_CAPTURE, $from)) {
+                $end = $b[0][1];
+            }
+            return self::staticResponseForMethods(substr($content, $start, $end - $start), $methods);
+        } catch (\Throwable $e) {
+            return null;
+        }
     }
 }

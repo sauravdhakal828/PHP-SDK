@@ -77,15 +77,28 @@ class BotVersionClient
 
     public function updateEndpoint(array $endpoint): void
     {
+        $payload = [
+            'workspaceKey' => $this->apiKey,
+            'method'       => $endpoint['method'] ?? null,
+            'path'         => $endpoint['path'] ?? null,
+            'requestBody'  => $endpoint['requestBody'] ?? $endpoint['request_body'] ?? null,
+            'responseBody' => $endpoint['responseBody'] ?? $endpoint['response_body'] ?? null,
+            'detectedBy'   => $endpoint['detectedBy'] ?? $endpoint['detected_by'] ?? 'runtime',
+        ];
+
         try {
-            $this->post('/api/sdk/update-endpoint', [
-                'workspaceKey' => $this->apiKey,
-                'method'       => $endpoint['method'] ?? null,
-                'path'         => $endpoint['path'] ?? null,
-                'requestBody'  => $endpoint['requestBody'] ?? $endpoint['request_body'] ?? null,
-                'detectedBy'   => $endpoint['detectedBy'] ?? $endpoint['detected_by'] ?? 'runtime',
-            ]);
+            $this->post('/api/sdk/update-endpoint', $payload);
+            // Debug only: shows what was sent and in what order
+            if ($this->debug) {
+                error_log(sprintf(
+                    '[botversion] sent update %s %s (request=%s, response=%s)',
+                    $payload['method'], $payload['path'],
+                    $payload['requestBody'] ? 'yes' : 'no',
+                    $payload['responseBody'] ? 'yes' : 'no'
+                ));
+            }
         } catch (\Exception $e) {
+            if ($this->debug) error_log('[botversion] update_endpoint failed: ' . $e->getMessage());
         }
     }
 
