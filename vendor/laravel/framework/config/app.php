@@ -55,9 +55,9 @@ return [
     |
     */
 
-    'url' => env('APP_URL', 'https://botversion.com'),
+    'url' => env('APP_URL', 'https://console.botversion.com'),
 
-    'frontend_url' => env('FRONTEND_URL', 'https://botversion.com'),
+    'frontend_url' => env('FRONTEND_URL', 'https://console.botversion.com'),
 
     'asset_url' => env('ASSET_URL'),
 

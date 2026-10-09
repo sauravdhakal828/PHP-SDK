@@ -137,7 +137,7 @@ class BotVersion
 
         self::$client = new BotVersionClient([
             'api_key'      => $apiKey,
-            'platform_url' => $options['platform_url'] ?? 'https://botversion.com',
+            'platform_url' => $options['platform_url'] ?? 'https://console.botversion.com',
             'debug'        => $debug,
             'timeout'      => $options['timeout'] ?? 5,
         ]);

@@ -52,7 +52,7 @@ function botversion_main(): void
     botversion_load_env_files($cwd);
 
     $apiKey      = getenv('BOTVERSION_API_KEY') ?: null;
-    $platformUrl = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://botversion.com';
+    $platformUrl = getenv('BOTVERSION_PLATFORM_URL') ?: 'https://console.botversion.com';
 
     if (!$apiKey) {
         echo "[botversion] BOTVERSION_API_KEY environment variable is not set. Skipping backend endpoint scan.\n";
